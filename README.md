@@ -1,97 +1,122 @@
-# AutoVulnScan
+<p align="center">
+  <img src="assets/logo.png" alt="AutoVulnScan" width="700"/>
+</p>
 
-**Stealth-first automated vulnerability scanner (pure Python).**
+<p align="center">
+  <strong>Stealth-first automated vulnerability scanner — pure Python.</strong>
+</p>
 
-AutoVulnScan is an educational project that automates a practical vuln-assessment workflow: host discovery, port scanning, service and OS fingerprinting, CVE correlation, optional exploit validation, and report generation.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white"/>
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square"/>
+  <img src="https://img.shields.io/badge/NVD%20API-NIST%20v2.0-orange?style=flat-square"/>
+  <img src="https://img.shields.io/badge/Use-Educational%20Only-red?style=flat-square"/>
+</p>
 
 ---
 
-## Current Pipeline (latest)
+## Overview
 
-```text
-Optional Host Discovery
-    -> Port Scan
-    -> Service Identification (with protocol-aware probes)
-    -> OS Detection (SMB negotiate)
-    -> CVE Matching (NVD + internal KB fallback)
-    -> Exploit Validation (non-destructive checks)
-    -> HTML + JSON Report
+AutoVulnScan automates a practical vulnerability assessment workflow from a single terminal interface. It performs host discovery, port scanning, service and OS fingerprinting, CVE correlation against the NIST NVD, optional exploit validation, and produces clean HTML and JSON reports — all without installing Nmap or any binary dependencies.
+
+The interface is a **page-based TUI** with full arrow-key navigation, not a flags-driven CLI.
+
+---
+
+## Pipeline
+
+```
+Host Discovery (optional)
+      │
+      ▼
+  Port Scan  ──────────────────────────────── stealth profile applied
+      │
+      ▼
+  Service Identification  ─────────────────── protocol-aware banner probes
+      │
+      ▼
+  OS Detection  ───────────────────────────── SMB negotiate handshake
+      │
+      ▼
+  CVE Matching  ───────────────────────────── NVD CPE → keyword → internal KB
+      │
+      ▼
+  Exploit Validation  ─────────────────────── non-destructive checks only
+      │
+      ▼
+  Report Generation  ──────────────────────── HTML + JSON
 ```
 
-The UI is a **page-based TUI** (arrow-key navigation), not argparse-style flags.
-
 ---
 
-## Core Features
+## Features
 
-### 1) Stealth-first scanning
+### Stealth-First Scanning
 
-- Randomized probe/port order
-- Delay + jitter controls
-- Limited concurrency via profile
+Every scan is designed to minimize noise on the wire:
+
+- Randomized probe and port ordering
+- Per-profile delay and jitter controls
+- Bounded thread concurrency
 - Passive-first banner grabbing
 - Clean socket teardown on every connection
-- No ICMP requirement for discovery (TCP-based host liveness)
+- TCP-based host liveness — no ICMP dependency
 
-### 2) Stealth profiles
+### Stealth Profiles
 
-| Profile | Delay | Jitter | Threads | Timeout | Purpose |
-|---|---:|---:|---:|---:|---|
-| `normal` | 0.0s | 0.0s | 50 | 0.5s | Fast, noisier |
-| `quiet` | 0.05s | 0.05s | 25 | 1.0s | Balanced |
-| `ghost` | 0.2s | 0.15s | 10 | 1.5s | Maximum stealth |
+| Profile  | Delay  | Jitter  | Threads | Timeout | Intended Use         |
+|----------|-------:|--------:|--------:|--------:|----------------------|
+| `normal` | 0.0 s  | 0.0 s   | 50      | 0.5 s   | Fast internal audits |
+| `quiet`  | 0.05 s | 0.05 s  | 25      | 1.0 s   | Balanced stealth     |
+| `ghost`  | 0.2 s  | 0.15 s  | 10      | 1.5 s   | Maximum evasion      |
 
-### 3) Better Windows service/OS accuracy
+### Windows Service and OS Accuracy
 
-- SMB/NetBIOS/RPC are identified with protocol-aware probing (not only text banners)
+Standard banner grabbing fails on Windows RPC/SMB/NetBIOS. AutoVulnScan uses protocol-aware probing:
+
 - SMB dialect extraction (e.g., `SMB 3.1.1`)
-- OS detection using SMB negotiate (`scanner\os_detect.py`)
-- OS generation classification (`modern` vs `legacy`)
+- OS generation classification (`modern` vs `legacy`) via SMB negotiate
+- RPC, NetBIOS, and SMB identified through actual protocol handshakes, not text patterns
 
-### 4) CVE intelligence with false-positive controls
+### CVE Intelligence with False-Positive Controls
 
-`cve_lookup\cve_match.py` uses a multi-step strategy:
+`cve_lookup/cve_match.py` applies a layered matching strategy:
 
-1. **NVD CPE query** (most precise)
-2. **NVD keyword query** fallback
-3. **Internal curated CVE KB** (`known_cves.py`) when API quality is low or empty
+1. **NVD CPE query** — most precise, fewest false positives
+2. **NVD keyword query** — broader fallback for unrecognized services
+3. **Internal curated KB** (`known_cves.py`) — when API quality is low or rate-limited
 
-Then it applies:
+Each result then passes through:
 
-- Platform relevance filtering (`cpe_filter.py`)
-- Service-topic relevance filtering (SMB/RPC topic checks)
-- Version range relevance filtering (when range data exists)
-- CVSS threshold (`>= 7.0`)
-- **Modern patch-state skip:** CVEs marked `patched_in_modern=true` are skipped when detected OS generation is `modern`
+- Platform relevance filtering via `cpe_filter.py`
+- Service-topic checks (SMB, RPC, NetBIOS topic gating)
+- Version range filtering where CPE range data is available
+- CVSS threshold gate (`>= 7.0` by default)
+- **Modern patch-state suppression** — CVEs flagged `patched_in_modern=true` are suppressed when the detected OS generation is `modern`
 
-### 5) Deduplicated reporting
+### Deduplicated Reporting
 
-- Matching remains **per-port** in JSON (`cve_results` dict by port)
-- A deduplicated view is generated for display/reporting via:
-  - `deduplicate_cve_results(cve_results)`
-- HTML CVE section shows one CVE row with merged ports (example: `139, 445`)
+The per-port CVE structure is preserved in full in JSON for downstream tooling. A deduplicated view is computed for display via `deduplicate_cve_results()`, merging duplicate CVE IDs across ports. The HTML report shows one CVE row per unique ID with a merged ports column (e.g., `139, 445`).
 
-### 6) Safe exploit validation
+### Safe Exploit Validation
 
-- Non-destructive validation only
-- No payload execution
-- Current validator includes `CVE-2011-2523` (vsftpd backdoor check pattern)
+- No payload execution, no system commands
+- Connection-level checks only
+- Current validator: `CVE-2011-2523` vsftpd 2.3.4 backdoor pattern
 
 ---
 
 ## Installation
 
-**Requirements:** Python 3.8+
+**Requires:** Python 3.8+
 
 ```bash
+git clone https://github.com/MohmedhKA/AutoVulnScan.git
 cd AutoVulnScan
 pip install -r requirements.txt
 ```
 
-Current dependencies:
-
-- `requests`
-- `python-dotenv`
+Dependencies: `requests`, `python-dotenv`
 
 ---
 
@@ -99,59 +124,61 @@ Current dependencies:
 
 ### NVD API Key
 
-Preferred setup:
-
 ```bash
 cp .env.example .env
 ```
 
-Then set:
+Edit `.env`:
 
 ```env
 NVD_API_KEY=your_key_here
 ```
 
-Key loading order:
+Obtain a free key at [nvd.nist.gov/developers/request-an-api-key](https://nvd.nist.gov/developers/request-an-api-key).
 
-1. `NVD_API_KEY` from environment / `.env`
+Key resolution order:
+
+1. `NVD_API_KEY` from environment or `.env`
 2. `api.txt` (legacy fallback)
 
-### NVD endpoint used
-
-`https://services.nvd.nist.gov/rest/json/cves/2.0`
-
-If your API key gets rejected (some keys return `403`/`404`), the code automatically retries unauthenticated mode.
+If the key is rejected with `403` or `404`, the scanner automatically retries in unauthenticated mode (rate-limited to 5 requests / 30 s).
 
 ---
 
 ## Usage
 
-### Launch the TUI
+### Launch
 
 ```bash
 python main.py
 ```
 
-### TUI flow
+### TUI Flow
 
+```
 1. Welcome screen
-2. Choose target mode:
-   - Discover hosts on subnet
-   - Enter target IP directly
-3. Set port range + stealth profile
-4. Run pipeline phases
-5. Review results dashboard
-6. Save HTML/JSON report (optional)
+2. Select target mode:
+     a. Discover hosts on subnet  →  sweep + select from live hosts
+     b. Enter target IP directly
+3. Set port range and stealth profile
+4. Pipeline runs phase by phase with live output
+5. Results dashboard
+6. Save HTML / JSON report
+```
 
-### Keyboard controls
+### Keyboard Controls
 
-- `↑` / `↓`: navigate
-- `Enter`: select
-- `ESC`: back (where applicable)
+| Key        | Action              |
+|------------|---------------------|
+| `↑` / `↓` | Navigate menu       |
+| `Enter`    | Confirm / select    |
+| `ESC`      | Go back             |
 
 ---
 
-## Running Modules Directly (for testing)
+## Running Modules Directly
+
+Each module can be invoked standalone for testing:
 
 ```bash
 # Host discovery
@@ -160,16 +187,16 @@ python scanner/network_sweep.py 192.168.1.0/24
 # Port scan
 python scanner/port_scan.py 192.168.1.10 1 1024
 
-# Service ID
+# Service identification
 python scanner/service_id.py 192.168.1.10 135 139 445
 
-# OS detect
+# OS detection
 python scanner/os_detect.py 192.168.1.10
 
-# NVD lookup by keyword
+# NVD keyword lookup
 python cve_lookup/nvd_api.py "OpenSSH 8.2"
 
-# CVE match from synthetic service map input
+# CVE matching from synthetic service map
 python cve_lookup/cve_match.py 192.168.1.10 445:SMB_3.1.1 135:Microsoft_Windows_RPC
 ```
 
@@ -177,35 +204,35 @@ python cve_lookup/cve_match.py 192.168.1.10 445:SMB_3.1.1 135:Microsoft_Windows_
 
 ## Report Output
 
-Generated files:
-
-- `scan_<target>_<timestamp>.json` (raw per-port results)
-- `scan_<target>_<timestamp>.html` (deduplicated CVE presentation)
-
-JSON keeps full per-port detail for tooling; HTML is optimized for readability.
+| File | Contents |
+|------|----------|
+| `scan_<target>_<timestamp>.json` | Full per-port data — services, CVEs, OS info, validation |
+| `scan_<target>_<timestamp>.html` | Deduplicated CVE table, optimized for readability |
 
 ---
 
 ## Project Structure
 
-```text
+```
 AutoVulnScan/
-├── main.py
-├── config.py
+├── main.py                   # TUI application entry point
+├── config.py                 # Stealth profiles, settings, API key loader
+├── assets/
+│   └── logo.png              # Project logo
 ├── scanner/
-│   ├── network_sweep.py
-│   ├── port_scan.py
-│   ├── service_id.py
-│   └── os_detect.py
+│   ├── network_sweep.py      # TCP-based host discovery
+│   ├── port_scan.py          # Stealth port scanner
+│   ├── service_id.py         # Protocol-aware banner grabbing
+│   └── os_detect.py          # SMB OS fingerprinting
 ├── cve_lookup/
-│   ├── nvd_api.py
-│   ├── cve_match.py
-│   ├── cpe_filter.py
-│   └── known_cves.py
+│   ├── nvd_api.py            # NIST NVD API client
+│   ├── cve_match.py          # Multi-strategy CVE matching
+│   ├── cpe_filter.py         # CPE-based relevance filtering
+│   └── known_cves.py         # Internal curated CVE knowledge base
 ├── exploits/
-│   └── validator.py
+│   └── validator.py          # Non-destructive exploit validators
 ├── report/
-│   └── generate.py
+│   └── generate.py           # HTML + JSON report generator
 ├── requirements.txt
 ├── .env.example
 └── .gitignore
@@ -213,21 +240,20 @@ AutoVulnScan/
 
 ---
 
-## Security / Git Hygiene
+## Security Notes
 
-Do **not** commit sensitive/runtime files:
+Never commit sensitive runtime files. The `.gitignore` is preconfigured to exclude:
 
-- `.env`
-- `api.txt`
-- `cve_cache.json`
-- `scan_*.html`
-- `scan_*.json`
-
-(`.gitignore` is already configured for these.)
+```
+.env
+api.txt
+cve_cache.json
+scan_*.html
+scan_*.json
+```
 
 ---
 
 ## Disclaimer
 
-For **educational and authorized** testing only. Scan systems you own or are explicitly permitted to assess.
-
+AutoVulnScan is built for **educational purposes and authorized security assessments only**. Scanning systems without explicit permission is illegal. Use responsibly and only on infrastructure you own or have written authorization to test.
