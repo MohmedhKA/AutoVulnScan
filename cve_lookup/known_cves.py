@@ -21,9 +21,8 @@ DATA QUALITY:
 
 USAGE:
   from cve_lookup.known_cves import lookup_known_cves
-  cves = lookup_known_cves("SMB", "3.1.1", "windows")
+   cves = lookup_known_cves("SMB", "3.1.1", "windows")
 """
-
 
 # ============================================================
 # KNOWN CVE DATABASE
@@ -34,6 +33,9 @@ USAGE:
 #   min_smb_dialect: minimum SMB dialect (hex) for SMB-specific CVEs
 #   max_smb_dialect: maximum SMB dialect (hex)
 #   cve: dict with id, cvss, severity, description, affected, remediation
+#        Optional version bounds:
+#          - min_version: minimum affected service version (inclusive)
+#          - max_version: maximum affected service version (inclusive)
 #
 # IMPORTANT: Only include CVEs with CVSS >= 7.0 (HIGH/CRITICAL)
 
@@ -234,6 +236,8 @@ KNOWN_CVE_DB = [
                 "execute it."
             ),
             "affected": "Samba 3.5.0 through 4.6.3 (Linux/Unix)",
+            "min_version": "3.5.0",
+            "max_version": "4.6.3",
             "remediation": "Update Samba to 4.6.4+, 4.5.10+, or 4.4.14+.",
             "year": 2017,
             "smb_versions": [],
@@ -259,6 +263,8 @@ KNOWN_CVE_DB = [
                 "a username containing ':)' opens a shell listener on port 6200."
             ),
             "affected": "vsftpd 2.3.4 only (compromised distribution)",
+            "min_version": "2.3.4",
+            "max_version": "2.3.4",
             "remediation": "Upgrade to vsftpd 2.3.5 or later.",
             "year": 2011,
             "smb_versions": [],
@@ -284,8 +290,36 @@ KNOWN_CVE_DB = [
                 "as root on glibc-based Linux systems."
             ),
             "affected": "OpenSSH 8.5p1 through 9.7p1 (glibc-based Linux)",
+            "min_version": "8.5p1",
+            "max_version": "9.7p1",
             "remediation": "Update to OpenSSH 9.8p1 or later.",
             "year": 2024,
+            "smb_versions": [],
+            "patched_in_modern": False,
+            "source": "internal_kb",
+        },
+    },
+    {
+        "service_patterns": ["unrealircd", "unreal"],
+        "os_family": "any",
+        "cve": {
+            "id": "CVE-2010-2075",
+            "cvss": 10.0,
+            "severity": "CRITICAL",
+            "description": (
+                "UnrealIRCd 3.2.8.1 backdoor - A trojaned source archive "
+                "distributed between Nov 2009 and Jun 2010 introduced a "
+                "backdoor that can execute commands when specially crafted "
+                "input (including AB;) is received."
+            ),
+            "affected": "UnrealIRCd 3.2.8.1 (trojaned source archive only)",
+            "min_version": "3.2.8.1",
+            "max_version": "3.2.8.1",
+            "remediation": (
+                "Replace with a clean UnrealIRCd build/version from trusted "
+                "sources; verify package integrity and signatures."
+            ),
+            "year": 2010,
             "smb_versions": [],
             "patched_in_modern": False,
             "source": "internal_kb",
@@ -310,6 +344,8 @@ KNOWN_CVE_DB = [
                 "enabled, this allows remote code execution."
             ),
             "affected": "Apache HTTP Server 2.4.49 only",
+            "min_version": "2.4.49",
+            "max_version": "2.4.49",
             "remediation": "Update to Apache 2.4.51 or later.",
             "year": 2021,
             "smb_versions": [],
@@ -330,6 +366,8 @@ KNOWN_CVE_DB = [
                 "can be set in .htaccess. Affects Apache 2.2.x and 2.4.x."
             ),
             "affected": "Apache 2.2.0 through 2.2.34, 2.4.0 through 2.4.27",
+            "min_version": "2.2.0",
+            "max_version": "2.4.27",
             "remediation": "Update to Apache 2.4.28+ or apply patch.",
             "year": 2017,
             "smb_versions": [],
@@ -355,6 +393,8 @@ KNOWN_CVE_DB = [
                 "attempting to authenticate (~1 in 256 chance per attempt)."
             ),
             "affected": "MySQL 5.1.x before 5.1.63, 5.5.x before 5.5.24, MariaDB 5.1-5.3",
+            "min_version": "5.1.0",
+            "max_version": "5.5.23",
             "remediation": "Update MySQL to 5.1.63+, 5.5.24+, or 5.6+.",
             "year": 2012,
             "smb_versions": [],

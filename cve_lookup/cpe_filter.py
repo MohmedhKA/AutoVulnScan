@@ -212,6 +212,66 @@ _DESC_RPC_TOPIC = re.compile(
     r'\b(rpc|remote\s+procedure\s+call|msrpc|dcom)\b', re.I
 )
 
+# IRC client products that should not be matched against IRC daemon services.
+_IRC_CLIENT_PRODUCTS = {
+    "xchat", "trillian", "bitchx", "muh", "pirch", "pirch_irc",
+    "ircit", "irssi", "epic4", "kicq", "ircii",
+}
+
+# SMB ecosystem products that are not Linux Samba server vulnerabilities.
+_SMB_NON_SAMBA_VENDORS = {"owncloud", "sysaid", "sap"}
+
+
+def _is_irc_daemon_service(svc_lower):
+    """True when scanned service appears to be an IRC server/daemon."""
+    return any(token in svc_lower for token in ("unrealircd", "ircd", "irc"))
+
+
+def is_irc_client_product(cpe_string):
+    """
+    Return True when a CPE string refers to known IRC client software.
+
+    This helps avoid server-side false positives on IRC daemon ports.
+    """
+    cpe = parse_cpe(cpe_string or "")
+    vendor = cpe.get("vendor", "")
+    product = cpe.get("product", "")
+    blob = f"{vendor}:{product}:{str(cpe_string).lower()}"
+    return any(token in blob for token in _IRC_CLIENT_PRODUCTS)
+
+
+def _is_linux_samba_context(svc_lower, detected_os, os_info=None, service_map=None):
+    """
+    Heuristic for Linux/Samba SMB context.
+
+    Treat SMB services as Samba-like when:
+      - detected OS is linux, OR
+      - detected OS is unknown, SMB dialect is SMB 1.0, and a Samba
+        service hint is present in the service map.
+    """
+    if "smb" not in svc_lower and "netbios" not in svc_lower:
+        return False
+
+    if detected_os == "linux":
+        return True
+
+    if detected_os != "unknown" or not os_info:
+        return False
+
+    smb_version = str(os_info.get("smb_version", "")).strip().lower()
+    if smb_version != "smb 1.0":
+        return False
+
+    if "samba" in svc_lower:
+        return True
+
+    if service_map:
+        for svc in service_map.values():
+            if "samba" in str(svc).lower():
+                return True
+
+    return False
+
 
 def _is_service_relevant(cpe_list, description, svc_lower):
     """
@@ -243,12 +303,30 @@ def _is_service_relevant(cpe_list, description, svc_lower):
     return True, "service-topic check not needed"
 
 
-def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os):
+def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os, os_info=None, service_map=None):
     """Check CPE data for platform relevance. Returns (ok, reason) or None."""
     if not cpe_list:
         return None  # No CPE data → fall through to description check
 
     pairs, vendors, products = _vendors_products(cpe_list)
+
+    # IRC daemon ports should not keep IRC client-side CVEs.
+    if _is_irc_daemon_service(svc_lower):
+        irc_client_hits = []
+        non_client_entries = 0
+        for entry in cpe_list:
+            criteria = entry.get("criteria", "")
+            if not criteria:
+                continue
+            if is_irc_client_product(criteria):
+                parsed = parse_cpe(criteria)
+                pname = parsed.get("product") or criteria
+                irc_client_hits.append(pname)
+            else:
+                non_client_entries += 1
+        if irc_client_hits and non_client_entries == 0:
+            hit_preview = ", ".join(sorted(set(irc_client_hits))[:4])
+            return False, f"IRC client-side CVE ({hit_preview})"
 
     # Always drop packet-analyzer CVEs
     if vendors & _ANALYZER_VENDORS or products & _ANALYZER_PRODUCTS:
@@ -277,6 +355,23 @@ def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os):
         is_win_only = bool(vendors & {"microsoft"}) and not bool(pairs & _SAMBA)
         if is_win_only:
             return False, "Windows-only CVE, target is Linux"
+
+    # Linux/Samba SMB context: drop non-Samba SMB ecosystem products.
+    # Example false positives: novell:netware, ownCloud SMB app, SysAid, SAP.
+    if _is_linux_samba_context(svc_lower, detected_os, os_info=os_info, service_map=service_map):
+        non_samba_hits = []
+        other_platform_seen = False
+        for vendor, product in pairs:
+            if vendor == "novell" and product == "netware":
+                non_samba_hits.append(f"{vendor}:{product}")
+                continue
+            if vendor in _SMB_NON_SAMBA_VENDORS:
+                non_samba_hits.append(f"{vendor}:{product}")
+                continue
+            other_platform_seen = True
+        if non_samba_hits and not other_platform_seen:
+            preview = ", ".join(sorted(set(non_samba_hits))[:4])
+            return False, f"non-Samba SMB ecosystem CVE ({preview})"
 
     # Check for ancient Windows versions when target is modern Windows
     if detected_os == "windows" and ("smb" in svc_lower or "rpc" in svc_lower):
@@ -401,7 +496,7 @@ def is_version_relevant(cpe_list, service_version):
 # MAIN APPLICABILITY CHECK
 # ============================================================
 
-def is_cve_applicable(cve, service_name, service_version, detected_os):
+def is_cve_applicable(cve, service_name, service_version, detected_os, os_info=None, service_map=None):
     """
     Determine if a CVE is truly applicable to the detected service/OS.
 
@@ -419,7 +514,13 @@ def is_cve_applicable(cve, service_name, service_version, detected_os):
     svc_lower = service_name.lower()
 
     # 1. Platform check via CPE
-    cpe_result = _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os)
+    cpe_result = _is_platform_relevant_by_cpe(
+        cpe_list,
+        svc_lower,
+        detected_os,
+        os_info=os_info,
+        service_map=service_map,
+    )
 
     if cpe_result is not None:
         ok, reason = cpe_result
@@ -444,7 +545,7 @@ def is_cve_applicable(cve, service_name, service_version, detected_os):
     return True, "applicable"
 
 
-def filter_cves(cves, service_name, service_version, detected_os):
+def filter_cves(cves, service_name, service_version, detected_os, os_info=None, service_map=None):
     """
     Filter a CVE list to only those applicable to the detected service.
 
@@ -461,7 +562,14 @@ def filter_cves(cves, service_name, service_version, detected_os):
     applicable, filtered_out = [], []
 
     for cve in cves:
-        ok, reason = is_cve_applicable(cve, service_name, service_version, detected_os)
+        ok, reason = is_cve_applicable(
+            cve,
+            service_name,
+            service_version,
+            detected_os,
+            os_info=os_info,
+            service_map=service_map,
+        )
         cve_copy = dict(cve)
         cve_copy["applicability_note"] = reason
         if ok:

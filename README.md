@@ -88,6 +88,11 @@ Standard banner grabbing fails on Windows RPC/SMB/NetBIOS. AutoVulnScan uses pro
 2. **NVD keyword query** — broader fallback for unrecognized services
 3. **Internal curated KB** (`known_cves.py`) — when API quality is low or rate-limited
 
+Supporting components:
+
+- **`cve_lookup/cpe_filter.py`**: filters raw CVE candidates by platform relevance, service topic relevance, and version-range relevance to reduce noisy matches.
+- **`cve_lookup/known_cves.py`**: internal curated knowledge base used when NVD responses are weak, missing, or overly broad for practical service-level matching.
+
 Each result then passes through:
 
 - Platform relevance filtering via `cpe_filter.py`
@@ -102,9 +107,17 @@ The per-port CVE structure is preserved in full in JSON for downstream tooling. 
 
 ### Safe Exploit Validation
 
-- No payload execution, no system commands
-- Connection-level checks only
-- Current validator: `CVE-2011-2523` vsftpd 2.3.4 backdoor pattern
+- Validation is **non-destructive** and **confidence-oriented** (not exploitation)
+- No payload execution, no command execution on target, no shell/persistence behavior
+- Uses connection/protocol checks and service-era fingerprinting only
+
+Currently supported validators:
+
+- `CVE-2011-2523` — vsftpd 2.3.4 backdoor pattern check
+- `CVE-2004-2687` — distcc exposure check (safe protocol preamble only)
+- `CVE-2007-2447` — Samba legacy username-map-script era risk check
+
+More protocol-aware validators are planned in future releases.
 
 ---
 
@@ -244,6 +257,15 @@ python cve_lookup/cve_match.py 192.168.1.10 445:SMB_3.1.1 135:Microsoft_Windows_
 |------|----------|
 | `scan_<target>_<timestamp>.json` | Full per-port data — services, CVEs, OS info, validation |
 | `scan_<target>_<timestamp>.html` | Deduplicated CVE table, optimized for readability |
+
+---
+
+## Roadmap / Future Work
+
+- Add more protocol-aware non-destructive validators for additional services/CVEs
+- Improve OS and service fingerprint depth (while preserving stealth defaults)
+- Expand curated CVE coverage for services with noisy public metadata
+- Enhance confidence scoring and prioritization for remediation workflows
 
 ---
 

@@ -30,6 +30,7 @@ import time         # For delays and timing
 import random       # For randomizing order
 import sys          # For command line arguments
 import os           # For path operations
+import re           # For banner pattern matching
 
 
 # ============================================================
@@ -122,7 +123,7 @@ PORT_SERVICE_NAMES = {
     135: "MSRPC",   139: "NetBIOS", 143: "IMAP",    443: "HTTPS",
     445: "SMB",     993: "IMAPS",   995: "POP3S",   1099: "Java RMI",
     1433: "MSSQL",  1521: "Oracle", 2049: "NFS",    2121: "FTP",
-    3306: "MySQL",  3389: "RDP",    5432: "PostgreSQL",
+    3306: "MySQL",  3389: "RDP",    3632: "distccd", 5432: "PostgreSQL",
     5900: "VNC",    5901: "VNC",    6000: "X11",    6667: "IRC",
     8009: "AJP",    8080: "HTTP-Proxy", 8443: "HTTPS-Alt",
     8180: "HTTP-Alt",
@@ -130,7 +131,7 @@ PORT_SERVICE_NAMES = {
 
 # Ports that need protocol-specific probes instead of banner grabbing
 # These services don't send plain-text banners; we use binary protocol probes
-PROTOCOL_PROBE_PORTS = {445, 139, 135}
+PROTOCOL_PROBE_PORTS = {445, 139, 135, 3632}
 
 
 # ============================================================
@@ -251,6 +252,67 @@ def _probe_msrpc_service(target_ip, port, timeout):
     return "Microsoft Windows RPC"
 
 
+def _probe_distccd_service(target_ip, port, timeout):
+    """
+    Identify distccd on its default port (3632) using a safe minimal probe.
+
+    Non-destructive behavior:
+      - connect and optionally read passive response
+      - send a tiny protocol preamble (not a compile/command request)
+      - classify service based on response hints
+    """
+    passive_text = ""
+    probe_text = ""
+    sock = None
+
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((target_ip, port))
+
+        # Passive read first
+        try:
+            sock.settimeout(min(timeout, 1.5))
+            data = sock.recv(256)
+            if data:
+                passive_text = data.decode("utf-8", errors="ignore").strip()
+        except (socket.timeout, OSError):
+            pass
+
+        # Safe distcc protocol preamble (compile frame prefix only, no payload)
+        try:
+            sock.settimeout(min(timeout, 1.5))
+            sock.sendall(b"DIST00000001ARGC00000000")
+            data = sock.recv(256)
+            if data:
+                probe_text = data.decode("utf-8", errors="ignore").strip()
+        except (socket.timeout, OSError):
+            pass
+
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        pass
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    evidence = probe_text or passive_text
+    if evidence:
+        clean = evidence.replace("\r", " ").replace("\n", " ").strip()
+        clean = clean[:140] + "..." if len(clean) > 140 else clean
+        lower = clean.lower()
+        if clean.startswith("DIST") or "distcc" in lower:
+            return "distccd", f"[distcc probe] {clean}"
+        return "distccd", f"[port 3632 response] {clean}"
+
+    return "distccd", "[distcc default port 3632 open]"
+
+
 # ============================================================
 # SHARED DATA
 # ============================================================
@@ -310,6 +372,21 @@ def identify_service(banner_text, port):
     if not banner_text:
         # No banner received - use port-based guess as fallback
         return PORT_SERVICE_NAMES.get(port, "Unknown")
+
+    # UnrealIRCd-specific detection to avoid collapsing into generic "IRC".
+    banner_lower = banner_text.lower()
+    if (
+        "unreal" in banner_lower
+        or "irc.metasploitable" in banner_lower
+        or re.search(r':irc\.[a-z0-9._-]+', banner_lower)
+    ):
+        version = (
+            extract_version(banner_text, "UnrealIRCd")
+            or extract_version(banner_text, "Unreal")
+        )
+        if version:
+            return f"UnrealIRCd {version}"
+        return "UnrealIRCd"
 
     # Check against our known signatures
     for signature, service_name in SERVICE_SIGNATURES:
@@ -422,6 +499,9 @@ def grab_banner(target_ip, port, timeout):
             # MSRPC: send RPC bind to confirm Microsoft RPC
             service_name = _probe_msrpc_service(target_ip, port, timeout)
             banner_text = f"[DCE/RPC Endpoint Mapper]"
+        elif port == 3632:
+            # distccd: default port with safe protocol preamble check
+            service_name, banner_text = _probe_distccd_service(target_ip, port, timeout)
 
         with service_results_lock:
             service_results[port] = {

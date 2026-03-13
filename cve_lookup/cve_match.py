@@ -29,6 +29,7 @@ USAGE (standalone):
 import time         # For rate limiting delays between queries
 import sys          # For command line arguments
 import os           # For path operations
+import re           # For version parsing
 
 # Import our modules
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -69,6 +70,67 @@ OS_LEVEL_SERVICES = [
 
 # Quality threshold: if API results score below this, use internal KB
 QUALITY_THRESHOLD = 0.25
+
+
+# ============================================================
+# INTERNAL KB VERSION GUARDS
+# ============================================================
+
+def _parse_loose_version(version_text):
+    """
+    Parse loose versions like:
+      "4.7p1" -> (4, 7, 1)
+      "2.4.49" -> (2, 4, 49)
+      "unknown" -> None
+    """
+    if version_text is None:
+        return None
+    text = str(version_text).strip().lower()
+    if not text or text in {"unknown", "n/a", "*", "-"}:
+        return None
+    nums = re.findall(r"\d+", text)
+    if not nums:
+        return None
+    return tuple(int(n) for n in nums[:4])
+
+
+def _normalize_version_len(a, b):
+    """Pad version tuples so lexicographic comparisons are stable."""
+    max_len = max(len(a), len(b))
+    return a + (0,) * (max_len - len(a)), b + (0,) * (max_len - len(b))
+
+
+def _kb_version_in_bounds(cve, service_version):
+    """
+    Check whether an internal KB CVE applies to the detected service version.
+
+    The check is only enforced when the CVE includes min/max bounds.
+    """
+    min_v = cve.get("min_version")
+    max_v = cve.get("max_version")
+
+    if not min_v and not max_v:
+        return True, "no internal KB version bounds"
+
+    sv = _parse_loose_version(service_version)
+    if sv is None:
+        return False, "service version unknown for bounded internal KB CVE"
+
+    if min_v:
+        min_t = _parse_loose_version(min_v)
+        if min_t:
+            sv_n, min_n = _normalize_version_len(sv, min_t)
+            if sv_n < min_n:
+                return False, f"version {service_version} below {min_v}"
+
+    if max_v:
+        max_t = _parse_loose_version(max_v)
+        if max_t:
+            sv_n, max_n = _normalize_version_len(sv, max_t)
+            if sv_n > max_n:
+                return False, f"version {service_version} above {max_v}"
+
+    return True, "within internal KB version bounds"
 
 
 # ============================================================
@@ -196,15 +258,39 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
             svc_name, svc_ver = parse_service_version(service_string)
             kb_cves = lookup_known_cves(svc_name, svc_ver, detected_os)
 
+            # Enforce internal KB version bounds to avoid false positives
+            # (e.g., OpenSSH 4.7p1 should not match CVE-2024-6387).
+            kb_in_range = []
+            kb_skipped = 0
+            for cve in kb_cves:
+                in_range, reason = _kb_version_in_bounds(cve, svc_ver)
+                if not in_range:
+                    kb_skipped += 1
+                    print(f"  [~] Port {port}: {cve.get('id', 'UNKNOWN')} skipped ({reason})")
+                    continue
+                kb_in_range.append(cve)
+            kb_cves = kb_in_range
+
             if kb_cves:
                 print(f"  [*] Port {port}: API quality low ({quality:.2f}), "
                       f"using internal KB ({len(kb_cves)} CVEs)")
                 all_cves = kb_cves
                 using_internal_kb = True
+            elif kb_skipped > 0:
+                print(f"  [~] Port {port}: all internal KB CVEs skipped by version bounds")
+                all_cves = []
+                using_internal_kb = True
 
         # ---- FILTERING ----
         svc_name, svc_ver = parse_service_version(service_string)
-        applicable, filtered_out = filter_cves(all_cves, svc_name, svc_ver, detected_os)
+        applicable, filtered_out = filter_cves(
+            all_cves,
+            svc_name,
+            svc_ver,
+            detected_os,
+            os_info=os_info,
+            service_map=service_map,
+        )
 
         if filtered_out and not using_internal_kb:
             print(f"  [~] Port {port}: filtered {len(filtered_out)} irrelevant CVE(s)")
