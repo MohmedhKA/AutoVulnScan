@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Logo.png" alt="AutoVulnScan" width="700"/>
+  <img src="assets/Logo.png" alt="AutoVulnScan" width="700" style="pointer-events: none;"/>
 </p>
 
 <p align="center">
@@ -7,10 +7,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square"/>
-  <img src="https://img.shields.io/badge/NVD%20API-NIST%20v2.0-orange?style=flat-square"/>
-  <img src="https://img.shields.io/badge/Use-Educational%20Only-red?style=flat-square"/>
+  <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white" style="pointer-events: none;"/>
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square" style="pointer-events: none;"/>
+  <img src="https://img.shields.io/badge/NVD%20API-NIST%20v2.0-orange?style=flat-square" style="pointer-events: none;"/>
+  <img src="https://img.shields.io/badge/Use-Educational%20Only-red?style=flat-square" style="pointer-events: none;"/>
 </p>
 
 ---
