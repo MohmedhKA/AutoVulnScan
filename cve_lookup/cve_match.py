@@ -37,6 +37,17 @@ from cve_lookup.nvd_api import query_nvd, query_nvd_by_cpe, get_cpe_for_service,
 from cve_lookup.cpe_filter import detect_os, filter_cves, parse_service_version
 from cve_lookup.known_cves import lookup_known_cves, get_cve_quality_score
 
+# Metasploitable2-oriented service version fallbacks.
+# Used only when service_id did not extract a version token.
+KNOWN_SERVICE_VERSIONS = {
+    "java rmi": "1.6.0_18",
+    "mysql": "5.0.51",
+    "postgresql": "8.3.1",
+    "nfs": "",
+    "rpcbind": "0.2.0",
+    "ajp": "5.5.0",
+}
+
 
 # ============================================================
 # CONFIGURATION
@@ -299,6 +310,12 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
 
         # ---- FILTERING ----
         svc_name, svc_ver = parse_service_version(service_string)
+        # If version was not detected by service_id.py, use known fallback
+        if not svc_ver:
+            fallback_key = svc_name.lower().strip()
+            svc_ver = KNOWN_SERVICE_VERSIONS.get(fallback_key, "")
+            if svc_ver:
+                print(f"  [*] Port {port}: using known version fallback '{svc_ver}' for '{svc_name}'")
         applicable, filtered_out = filter_cves(
             all_cves,
             svc_name,

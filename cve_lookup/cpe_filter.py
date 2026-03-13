@@ -162,17 +162,31 @@ _THIRDPARTY = {
     "freeradius", "pam_smb_project", "smb2www", "smbcms_project", "smbcms",
     "smartblog", "smblog", "netpbm", "ibm", "iss",
     "phpwebsite_project", "phpwebsite", "netmon",
-    "apache", "apache_http_server",
     "elinks_project", "links_project", "links",
+    "phpmyadmin", "basilix", "logicworks", "pam_mysql",
+    "axent", "pccs-linux", "teapop", "mysql_administrator",
 }
 
 # Third-party products (by product name in CPE)
 _THIRDPARTY_PRODUCTS = {
     "smbcms", "phpwebsite", "pam_smb", "rlm_smb", "smb2www",
     "smartblog", "smblog", "netmon", "network_monitor",
-    "apache_http_server", "smbvalid",
+    "apache_http_server", "http_server", "smbvalid",
     "elinks", "links",
+    "phpmyadmin", "mysqldatabaseadmintool", "pam_mysql", "basilixwebmail",
+    "weberp", "netprowler", "teapop",
 }
+
+# NFS: non-Linux OS vendors — CVEs targeting these are irrelevant
+# when the target is a Linux NFS server (nfs-utils / knfsd)
+_NFS_NON_LINUX_OS_VENDORS = {
+    "apple", "sgi", "sun", "digital", "novell", "ibm",
+    "freebsd", "netbsd", "openbsd", "bsdi",
+}
+
+# NFS: packet-sniffer/client tools — not the NFS server
+_NFS_TOOL_VENDORS = {"lbl", "tcpdump", "ethereal_project", "wireshark"}
+_NFS_TOOL_PRODUCTS = {"tcpdump", "ethereal", "wireshark"}
 
 # Old Windows versions — CVEs only affecting these are irrelevant for modern targets
 _OLD_WINDOWS_PRODUCTS = {
@@ -229,6 +243,11 @@ _DESC_X11_SERVER = re.compile(
     r'\b(x\.?org\s+server|xorg.server|x11\s+server|x\s+server|'
     r'x\.?org\s+x11|xfree86\s+server)\b', re.I
 )
+_NFS_NON_LINUX_DESC = re.compile(
+    r'\b(irix|solaris|sunos|mac\s*os|macosx|ultrix|netware|'
+    r'aix|hp-?ux|tru64)\b', re.I
+)
+_NFS_LINUX_DESC = re.compile(r'\b(linux|nfs-utils|knfsd|rpc\.nfsd)\b', re.I)
 
 # IRC client products that should not be matched against IRC daemon services.
 _IRC_CLIENT_PRODUCTS = {
@@ -326,6 +345,55 @@ def _is_service_relevant(cpe_list, description, svc_lower):
             return True, "service-topic matches Java RMI (by description)"
         return False, "CVE not related to Java RMI service"
 
+    # AJP connector port: only keep Tomcat and AJP-connector CVEs.
+    if "ajp" in svc_lower:
+        _AJP_CORE_VENDORS = {"apache", "vmware", "redhat", "pivotal"}
+        _AJP_CORE_PRODUCTS = {
+            "tomcat", "tc-server", "spring_framework",
+            "ajp", "jk_connector", "mod_jk",
+        }
+        _AJP_DROP_PRODUCTS = {
+            "undertow", "http_server", "jboss_eap",
+            "enterprise_security_manager",
+        }
+        _DESC_AJP = re.compile(
+            r'\b(ajp|tomcat|jk.?connector|mod.?jk|ghostcat|cve.2020.1938)\b',
+            re.I
+        )
+        if cpe_list:
+            _, vs, ps = _vendors_products(cpe_list)
+            drop_hits = ps & _AJP_DROP_PRODUCTS
+            if drop_hits:
+                return False, f"CVE targets non-Tomcat AJP product ({drop_hits})"
+            if ps & _AJP_CORE_PRODUCTS:
+                return True, "service-topic matches Tomcat/AJP"
+            if vs & _AJP_CORE_VENDORS and _DESC_AJP.search(desc):
+                return True, "service-topic matches AJP (vendor+description)"
+        if _DESC_AJP.search(desc):
+            return True, "service-topic matches AJP (by description)"
+        return False, "CVE not related to AJP/Tomcat service"
+
+    # MySQL port: only keep CVEs about the MySQL/MariaDB server itself.
+    if "mysql" in svc_lower:
+        _MYSQL_CORE_VENDORS = {"oracle", "mysql", "mariadb", "percona"}
+        _MYSQL_CORE_PRODUCTS = {"mysql", "mariadb", "mysql_server", "percona_server"}
+        if cpe_list:
+            _, vs, ps = _vendors_products(cpe_list)
+            # If ANY CPE is from a core vendor, it's relevant
+            if vs & _MYSQL_CORE_VENDORS or ps & _MYSQL_CORE_PRODUCTS:
+                return True, "service-topic matches MySQL core server"
+            # If CPE list exists but NO core vendor matched → drop
+            if vs:
+                return False, "CVE not about MySQL server (third-party CPE)"
+        # No CPE — check description
+        _DESC_MYSQL = re.compile(
+            r'\b(mysql\s+server|mysqld|mysqlcheck|mysql\s+\d|'
+            r'mysql\s+before\s+\d|mysql\s+\d\.\d)\b', re.I
+        )
+        if _DESC_MYSQL.search(desc):
+            return True, "service-topic matches MySQL (by description)"
+        return False, "CVE not about MySQL server (by description)"
+
     return True, "service-topic check not needed"
 
 
@@ -341,6 +409,24 @@ def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os, os_info=None,
         is_xorg = bool(vendors & _X11_SERVER_VENDORS) or bool(products & _X11_SERVER_PRODUCTS)
         if not is_xorg:
             return False, "non-X11-server CVE on X11 port"
+
+    # NFS port: only keep Linux / nfs-utils CVEs
+    if "nfs" in svc_lower:
+        pairs_local, vendors_local, products_local = _vendors_products(cpe_list)
+
+        # Drop packet-tool CVEs (tcpdump NFS parser bugs etc.)
+        if vendors_local & _NFS_TOOL_VENDORS or products_local & _NFS_TOOL_PRODUCTS:
+            return False, "NFS packet-tool CVE (tcpdump/Wireshark), not nfs-utils"
+
+        # Drop CVEs that ONLY target non-Linux OS vendors
+        if vendors_local:
+            non_linux = vendors_local & _NFS_NON_LINUX_OS_VENDORS
+            has_linux = bool(
+                vendors_local - _NFS_NON_LINUX_OS_VENDORS - {"nfs"}
+            )
+            if non_linux and not has_linux:
+                sample = ", ".join(sorted(non_linux)[:3])
+                return False, f"NFS CVE targets non-Linux OS ({sample})"
 
     # IRC daemon ports should not keep IRC client-side CVEs.
     if _is_irc_daemon_service(svc_lower):
@@ -421,7 +507,7 @@ def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os, os_info=None,
     return True, "platform matches"
 
 
-def _is_platform_relevant_by_desc(description, svc_lower, detected_os):
+def _is_platform_relevant_by_desc(description, svc_lower, detected_os, cpe_list=None):
     """Fallback: check description text for platform clues."""
     desc = description or ""
 
@@ -458,6 +544,10 @@ def _is_platform_relevant_by_desc(description, svc_lower, detected_os):
         if not _DESC_X11_SERVER.search(desc):
             return False, "non-X11-server CVE on X11 port (by description)"
 
+    if "nfs" in svc_lower and not cpe_list:
+        if _NFS_NON_LINUX_DESC.search(desc) and not _NFS_LINUX_DESC.search(desc):
+            return False, "NFS CVE targets non-Linux OS (by description)"
+
     return True, "no CPE data, passed description check"
 
 
@@ -466,11 +556,12 @@ def _is_platform_relevant_by_desc(description, svc_lower, detected_os):
 # ============================================================
 
 def _parse_ver(v_str):
-    """Convert "2.3.4" or "4.7p1" → (2, 3, 4) for comparison. None if invalid."""
+    """Convert version text into a tuple of numeric components."""
     if not v_str or v_str in ("*", "-", ""):
         return None
-    clean = re.split(r'[_\-]', v_str)[0]  # strip _sp6a, -rc1 suffixes
-    parts = re.findall(r'\d+', clean)
+    # Keep all numeric components so tokens like 1.6.0_131 are
+    # comparable against 1.6.0_18.
+    parts = re.findall(r'\d+', str(v_str))
     return tuple(int(p) for p in parts) if parts else None
 
 
@@ -564,7 +655,12 @@ def is_cve_applicable(cve, service_name, service_version, detected_os, os_info=N
             return False, reason
     else:
         # 2. Fallback: platform check via description text
-        ok, reason = _is_platform_relevant_by_desc(description, svc_lower, detected_os)
+        ok, reason = _is_platform_relevant_by_desc(
+            description,
+            svc_lower,
+            detected_os,
+            cpe_list=cpe_list,
+        )
         if not ok:
             return False, reason
 
