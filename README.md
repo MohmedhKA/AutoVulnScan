@@ -1,5 +1,7 @@
 <p align="center">
-  <img src="assets/Logo.png" alt="AutoVulnScan" width="700" style="pointer-events: none;"/>
+  <picture>
+    <img src="assets/Logo.png" alt="AutoVulnScan" width="700">
+  </picture>
 </p>
 
 <p align="center">
@@ -7,10 +9,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white" style="pointer-events: none;"/>
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square" style="pointer-events: none;"/>
-  <img src="https://img.shields.io/badge/NVD%20API-NIST%20v2.0-orange?style=flat-square" style="pointer-events: none;"/>
-  <img src="https://img.shields.io/badge/Use-Educational%20Only-red?style=flat-square" style="pointer-events: none;"/>
+  <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white" alt="Python 3.8+">
+  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform Windows and Linux">
+  <img src="https://img.shields.io/badge/NVD%20API-NIST%20v2.0-orange?style=flat-square" alt="NVD API NIST v2.0">
+  <img src="https://img.shields.io/badge/Use-Educational%20Only-red?style=flat-square" alt="Educational use only">
 </p>
 
 ---
@@ -120,6 +122,40 @@ Dependencies: `requests`, `python-dotenv`
 
 ---
 
+## Docker
+
+You can run AutoVulnScan in a container using the included `Dockerfile`.
+
+### Build image
+
+```bash
+docker build -t autovulnscan .
+```
+
+### Run interactive TUI
+
+```bash
+docker run --rm -it --env-file .env -v "$(pwd)/reports:/app/reports" autovulnscan
+```
+
+PowerShell example:
+
+```powershell
+docker run --rm -it --env-file .env -v "${PWD}\reports:/app/reports" autovulnscan
+```
+
+### Network note for LAN scanning
+
+For scanning hosts on your local network, use host networking when available:
+
+```bash
+docker run --rm -it --network host --env-file .env -v "$(pwd)/reports:/app/reports" autovulnscan
+```
+
+On Docker Desktop, host networking behavior can differ by platform/version. If needed, run with bridge networking and ensure routing/firewall rules allow access to your targets.
+
+---
+
 ## Configuration
 
 ### NVD API Key
@@ -215,10 +251,12 @@ python cve_lookup/cve_match.py 192.168.1.10 445:SMB_3.1.1 135:Microsoft_Windows_
 
 ```
 AutoVulnScan/
+├── Dockerfile                # Container runtime definition
+├── .dockerignore             # Keeps secrets/cache/reports out of build context
 ├── main.py                   # TUI application entry point
 ├── config.py                 # Stealth profiles, settings, API key loader
 ├── assets/
-│   └── logo.png              # Project logo
+│   └── Logo.png              # Project logo
 ├── scanner/
 │   ├── network_sweep.py      # TCP-based host discovery
 │   ├── port_scan.py          # Stealth port scanner
