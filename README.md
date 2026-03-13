@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="AutoVulnScan" width="700"/>
+  <img src="assets/Logo.png" alt="AutoVulnScan" width="700"/>
 </p>
 
 <p align="center">
