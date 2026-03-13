@@ -1,0 +1,308 @@
+"""
+cve_match.py - Smart CVE Matching with OS Awareness
+=====================================================
+This module takes the service identification results and looks up
+CVEs using the best available strategy:
+
+QUERY STRATEGY (in order of preference):
+  1. CPE-based NVD query — for well-known services with CPE mappings
+     (most precise, fewest false positives)
+  2. Keyword NVD query — for services without CPE mappings
+     (broader, may include some irrelevant results)
+  3. Internal Knowledge Base — fallback when NVD returns garbage
+     (curated, always accurate, but limited coverage)
+
+OS AWARENESS:
+  - Detects target OS from service signatures + SMB negotiate
+  - Filters CVEs by OS (e.g., no Samba CVEs on Windows targets)
+  - Uses OS-specific CPE strings for precise queries
+
+QUALITY CONTROL:
+  - Checks result quality (too many old/irrelevant CVEs = bad query)
+  - Falls back to internal KB when API quality is poor
+  - Cross-references results with OS and version info
+
+USAGE (standalone):
+    python cve_lookup/cve_match.py <target_ip> <port:service> [port:service ...]
+"""
+
+import time         # For rate limiting delays between queries
+import sys          # For command line arguments
+import os           # For path operations
+
+# Import our modules
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from cve_lookup.nvd_api import query_nvd, query_nvd_by_cpe, get_cpe_for_service, load_api_key
+from cve_lookup.cpe_filter import detect_os, filter_cves, parse_service_version
+from cve_lookup.known_cves import lookup_known_cves, get_cve_quality_score
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+# Minimum CVSS score to include in results
+MIN_CVSS_SCORE = 7.0
+
+# Delay between NVD API queries (seconds)
+QUERY_DELAY = 6
+
+# Services to skip (generic names that produce too many irrelevant results)
+# These are handled by OS-level CVE lookup instead
+SKIP_SERVICES = [
+    "Unknown",
+    "unknown",
+    "FTP",          # Too generic without a version
+    "SSH",          # Too generic without a version
+    "HTTP",         # Too generic without a version
+    "SMTP",         # Too generic without a version
+    "Telnet",       # Too generic without a version
+    "DNS",          # Too generic without a version
+]
+
+# Services that should use OS-level CPE query instead of keyword search
+# These are native OS services where keyword search returns garbage
+OS_LEVEL_SERVICES = [
+    "MSRPC", "Microsoft Windows RPC",
+    "NetBIOS", "NetBIOS-SSN",
+]
+
+# Quality threshold: if API results score below this, use internal KB
+QUALITY_THRESHOLD = 0.25
+
+
+# ============================================================
+# MAIN MATCHING FUNCTION
+# ============================================================
+
+def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None):
+    """
+    Look up CVEs for all identified services using the best strategy.
+
+    This is the MAIN function of this module. It:
+    1. Detects the target OS from service signatures
+    2. For each service, chooses the best query strategy:
+       a. CPE-based query for services with CPE mappings
+       b. Keyword query for unknown services
+       c. Internal KB fallback when API returns garbage
+    3. Filters results by OS, version, and CVSS score
+    4. Returns organized results per port
+
+    Args:
+        service_map (dict):  {port: "service version"} from service_id.py
+        min_cvss (float):    Minimum CVSS score (default 7.0)
+        api_key (str):       NVD API key (or None)
+        os_info (dict):      OS detection result from os_detect.py (optional)
+
+    Returns:
+        dict: Organized CVE results per port
+    """
+    if not service_map:
+        print("[*] No services to look up CVEs for.")
+        return {}
+
+    # Load API key if not provided
+    if api_key is None:
+        api_key = load_api_key()
+
+    # Detect OS from service map (enhanced with os_info if available)
+    if os_info and os_info.get("os_family", "unknown") != "unknown":
+        detected_os = os_info["os_family"]
+    else:
+        detected_os = detect_os(service_map)
+
+    results = {}
+    query_count = 0
+    already_queried = {}
+
+    print(f"\n[*] CVE matching for {len(service_map)} service(s)")
+    print(f"[*] Detected OS: {detected_os.upper()}")
+    if os_info and os_info.get("os_version"):
+        print(f"[*] OS Version:  {os_info['os_version']}")
+    print(f"[*] Minimum CVSS threshold: {min_cvss}")
+    print(f"[*] Strategy: CPE query → keyword query → internal KB fallback")
+    print()
+
+    # Track if we've already done an OS-level query
+    os_level_done = False
+    os_level_cves = []
+
+    for port in sorted(service_map.keys()):
+        service_string = service_map[port]
+        print(f"  [{port}] Service: {service_string}", end="")
+
+        # Skip completely generic/unknown services
+        if service_string in SKIP_SERVICES:
+            print(f" → SKIPPED (too generic)")
+            results[port] = {
+                "service": service_string,
+                "cves": [], "total_found": 0, "high_critical": 0,
+                "not_applicable": 0, "skipped": True
+            }
+            continue
+
+        # Check if this is an OS-level service (SMB, RPC, NetBIOS)
+        is_os_service = any(s.lower() in service_string.lower() for s in OS_LEVEL_SERVICES)
+        is_smb = "smb" in service_string.lower()
+
+        # ---- STRATEGY SELECTION ----
+        all_cves = []
+        query_method = "none"
+
+        service_key = service_string.strip().lower()
+
+        if service_key in already_queried:
+            print(f" → REUSING cached query")
+            all_cves = already_queried[service_key]
+            query_method = "cache"
+        else:
+            if query_count > 0:
+                print(f"\n  [*] Waiting {QUERY_DELAY}s (rate limit)...", end="")
+                time.sleep(QUERY_DELAY)
+            print()
+
+            # Strategy 1: CPE-based query (most precise)
+            cpe_string = get_cpe_for_service(service_string, os_info)
+
+            if cpe_string:
+                # For OS-level services, add a keyword filter
+                keyword = None
+                if is_smb:
+                    keyword = "SMB"
+                elif is_os_service:
+                    keyword = None  # OS CPE alone is sufficient
+
+                all_cves = query_nvd_by_cpe(cpe_string, keyword_filter=keyword,
+                                             api_key=api_key)
+                query_method = "cpe"
+                query_count += 1
+
+            # Strategy 2: Keyword query (broader)
+            if not all_cves and not is_os_service:
+                all_cves = query_nvd(service_string, api_key=api_key)
+                query_method = "keyword"
+                query_count += 1
+
+            already_queried[service_key] = all_cves
+
+        # ---- QUALITY CHECK ----
+        # If keyword search returned mostly old/irrelevant results, use internal KB
+        quality = get_cve_quality_score(all_cves)
+        using_internal_kb = False
+
+        if (quality < QUALITY_THRESHOLD and all_cves) or (not all_cves and query_method != "none"):
+            svc_name, svc_ver = parse_service_version(service_string)
+            kb_cves = lookup_known_cves(svc_name, svc_ver, detected_os)
+
+            if kb_cves:
+                print(f"  [*] Port {port}: API quality low ({quality:.2f}), "
+                      f"using internal KB ({len(kb_cves)} CVEs)")
+                all_cves = kb_cves
+                using_internal_kb = True
+
+        # ---- FILTERING ----
+        svc_name, svc_ver = parse_service_version(service_string)
+        applicable, filtered_out = filter_cves(all_cves, svc_name, svc_ver, detected_os)
+
+        if filtered_out and not using_internal_kb:
+            print(f"  [~] Port {port}: filtered {len(filtered_out)} irrelevant CVE(s)")
+            for c in filtered_out[:3]:
+                print(f"        → {c['id']}: {c.get('filter_reason', '?')}")
+            if len(filtered_out) > 3:
+                print(f"        → ... and {len(filtered_out)-3} more")
+
+        # CVSS threshold filter
+        filtered_cves = [c for c in applicable if c.get("cvss", 0) >= min_cvss]
+
+        results[port] = {
+            "service": service_string,
+            "cves": filtered_cves,
+            "total_found": len(all_cves),
+            "high_critical": len(filtered_cves),
+            "not_applicable": len(filtered_out),
+            "skipped": False,
+            "query_method": query_method,
+            "using_internal_kb": using_internal_kb,
+        }
+
+        if filtered_cves:
+            src = " (internal KB)" if using_internal_kb else ""
+            print(f"  [+] Port {port}: {len(filtered_cves)} HIGH/CRITICAL CVE(s){src}")
+        else:
+            print(f"  [-] Port {port}: No applicable CVEs above CVSS {min_cvss}")
+
+    # ---- SUMMARY ----
+    print(f"\n[+] CVE matching complete")
+    total_high = sum(r["high_critical"] for r in results.values())
+    total_all = sum(r["total_found"] for r in results.values())
+    total_filtered = sum(r.get("not_applicable", 0) for r in results.values())
+    print(f"[+] {total_high} applicable HIGH/CRITICAL CVE(s) "
+          f"(from {total_all} raw results, {total_filtered} filtered)")
+
+    if total_high > 0:
+        print(f"\n  {'PORT':<8} {'SERVICE':<25} {'CVE ID':<20} "
+              f"{'CVSS':<8} {'SEVERITY':<12}")
+        print(f"  {'-'*8} {'-'*25} {'-'*20} {'-'*8} {'-'*12}")
+        for port in sorted(results.keys()):
+            port_data = results[port]
+            for cve in port_data["cves"]:
+                svc = port_data["service"][:23]
+                print(f"  {port:<8} {svc:<25} {cve['id']:<20} "
+                      f"{cve['cvss']:<8} {cve['severity']:<12}")
+        print()
+
+    return results
+
+
+# ============================================================
+# STANDALONE MODE
+# ============================================================
+
+if __name__ == "__main__":
+    """
+    Run from command line:
+        python cve_lookup/cve_match.py 192.168.100.50 21:vsftpd_2.3.4 80:Apache_2.2.8
+
+    Port:service pairs use underscores instead of spaces.
+    """
+
+    if len(sys.argv) < 3:
+        print("Usage: python cve_lookup/cve_match.py <target_ip> "
+              "<port:service> [port:service ...]")
+        print("Example: python cve_lookup/cve_match.py 192.168.100.50 "
+              "21:vsftpd_2.3.4 80:Apache_2.2.8")
+        print("\nUse underscores for spaces in service names.")
+        sys.exit(1)
+
+    target = sys.argv[1]
+
+    # Parse port:service pairs
+    service_map = {}
+    for arg in sys.argv[2:]:
+        if ":" not in arg:
+            print(f"[!] Invalid format '{arg}' - use port:service_version")
+            continue
+        parts = arg.split(":", 1)
+        try:
+            port = int(parts[0])
+            service = parts[1].replace("_", " ")  # Underscores → spaces
+            service_map[port] = service
+        except ValueError:
+            print(f"[!] Invalid port number in '{arg}'")
+
+    if not service_map:
+        print("[!] No valid port:service pairs provided")
+        sys.exit(1)
+
+    print(f"\n[*] Target: {target}")
+    print(f"[*] Services to look up: {len(service_map)}")
+
+    results = match_cves(service_map)
+
+    # Check if we found anything critical
+    total = sum(r["high_critical"] for r in results.values())
+    if total > 0:
+        sys.exit(0)
+    else:
+        print("[*] No high/critical CVEs found.")
+        sys.exit(1)

@@ -1,0 +1,37 @@
+# ============================================================
+#  AutoVulnScan — .gitignore
+# ============================================================
+
+# ---- SECRETS — NEVER COMMIT THESE ----
+.env
+api.txt
+
+# ---- GENERATED SCAN REPORTS ----
+scan_*.html
+scan_*.json
+
+# ---- CVE CACHE (rebuilt automatically) ----
+cve_cache.json
+
+# ---- PYTHON CACHE ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# ---- VIRTUAL ENVIRONMENTS ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- OS FILES ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- EDITOR FILES ----
+.vscode/
+.idea/
+*.swp
+*.swo
