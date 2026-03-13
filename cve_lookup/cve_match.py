@@ -176,6 +176,7 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
     results = {}
     query_count = 0
     already_queried = {}
+    seen_service_results = {}
 
     print(f"\n[*] CVE matching for {len(service_map)} service(s)")
     print(f"[*] Detected OS: {detected_os.upper()}")
@@ -193,6 +194,22 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
         service_string = service_map[port]
         print(f"  [{port}] Service: {service_string}", end="")
 
+        service_key = " ".join(str(service_string).strip().lower().split())
+        if service_key in seen_service_results:
+            source_port, source_result = seen_service_results[service_key]
+            print(f" → REUSING result from port {source_port}")
+            results[port] = {
+                "service": service_string,
+                "cves": [dict(c) for c in source_result.get("cves", [])],
+                "total_found": source_result.get("total_found", 0),
+                "high_critical": source_result.get("high_critical", 0),
+                "not_applicable": source_result.get("not_applicable", 0),
+                "skipped": source_result.get("skipped", False),
+                "query_method": source_result.get("query_method", "cache"),
+                "using_internal_kb": source_result.get("using_internal_kb", False),
+            }
+            continue
+
         # Skip completely generic/unknown services
         if service_string in SKIP_SERVICES:
             print(f" → SKIPPED (too generic)")
@@ -201,6 +218,7 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
                 "cves": [], "total_found": 0, "high_critical": 0,
                 "not_applicable": 0, "skipped": True
             }
+            seen_service_results[service_key] = (port, results[port])
             continue
 
         # Check if this is an OS-level service (SMB, RPC, NetBIOS)
@@ -210,8 +228,6 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
         # ---- STRATEGY SELECTION ----
         all_cves = []
         query_method = "none"
-
-        service_key = service_string.strip().lower()
 
         if service_key in already_queried:
             print(f" → REUSING cached query")
@@ -328,6 +344,7 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
             "query_method": query_method,
             "using_internal_kb": using_internal_kb,
         }
+        seen_service_results[service_key] = (port, results[port])
 
         if filtered_cves:
             src = " (internal KB)" if using_internal_kb else ""

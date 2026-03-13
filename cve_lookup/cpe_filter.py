@@ -163,6 +163,7 @@ _THIRDPARTY = {
     "smartblog", "smblog", "netpbm", "ibm", "iss",
     "phpwebsite_project", "phpwebsite", "netmon",
     "apache", "apache_http_server",
+    "elinks_project", "links_project", "links",
 }
 
 # Third-party products (by product name in CPE)
@@ -170,6 +171,7 @@ _THIRDPARTY_PRODUCTS = {
     "smbcms", "phpwebsite", "pam_smb", "rlm_smb", "smb2www",
     "smartblog", "smblog", "netmon", "network_monitor",
     "apache_http_server", "smbvalid",
+    "elinks", "links",
 }
 
 # Old Windows versions — CVEs only affecting these are irrelevant for modern targets
@@ -210,6 +212,22 @@ _DESC_SMB_TOPIC = re.compile(
 )
 _DESC_RPC_TOPIC = re.compile(
     r'\b(rpc|remote\s+procedure\s+call|msrpc|dcom)\b', re.I
+)
+_DESC_RMI_TOPIC = re.compile(
+    r'\b(java\s+rmi|java\.rmi|rmi\s+registry|rmiregistry|'
+    r'remote\s+method\s+invocation)\b', re.I
+)
+_RMI_CORE_VENDORS = {"oracle", "sun", "openjdk"}
+_RMI_CORE_PRODUCTS = {"jre", "jdk", "java_se", "openjdk"}
+
+_X11_SERVER_VENDORS = {"x.org", "x_consortium", "xfree86", "x11"}
+_X11_SERVER_PRODUCTS = {
+    "x11r6", "x11r7", "xorg-server", "xfree86",
+    "x.org", "x11", "x_window_system",
+}
+_DESC_X11_SERVER = re.compile(
+    r'\b(x\.?org\s+server|xorg.server|x11\s+server|x\s+server|'
+    r'x\.?org\s+x11|xfree86\s+server)\b', re.I
 )
 
 # IRC client products that should not be matched against IRC daemon services.
@@ -282,7 +300,7 @@ def _is_service_relevant(cpe_list, description, svc_lower):
       CVE    = "Windows Encrypting File System RCE"
     """
     desc = description or ""
-    _, _, products = _vendors_products(cpe_list) if cpe_list else (set(), set(), set())
+    _, vendors, products = _vendors_products(cpe_list) if cpe_list else (set(), set(), set())
 
     # SMB / NetBIOS ports should only keep SMB-related CVEs.
     if "smb" in svc_lower or "netbios" in svc_lower:
@@ -300,6 +318,14 @@ def _is_service_relevant(cpe_list, description, svc_lower):
             return True, "service-topic matches RPC (by CPE product)"
         return False, "CVE not related to RPC service"
 
+    # Java RMI port should only keep genuine Java RMI CVEs.
+    if "rmi" in svc_lower:
+        if cpe_list and (vendors & _RMI_CORE_VENDORS or products & _RMI_CORE_PRODUCTS):
+            return True, "service-topic matches Java RMI (core JDK/JRE)"
+        if _DESC_RMI_TOPIC.search(desc):
+            return True, "service-topic matches Java RMI (by description)"
+        return False, "CVE not related to Java RMI service"
+
     return True, "service-topic check not needed"
 
 
@@ -309,6 +335,12 @@ def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os, os_info=None,
         return None  # No CPE data → fall through to description check
 
     pairs, vendors, products = _vendors_products(cpe_list)
+
+    # X11/X Display Server port: only keep genuine X.Org server CVEs
+    if "x11" in svc_lower or "x display" in svc_lower:
+        is_xorg = bool(vendors & _X11_SERVER_VENDORS) or bool(products & _X11_SERVER_PRODUCTS)
+        if not is_xorg:
+            return False, "non-X11-server CVE on X11 port"
 
     # IRC daemon ports should not keep IRC client-side CVEs.
     if _is_irc_daemon_service(svc_lower):
@@ -421,6 +453,10 @@ def _is_platform_relevant_by_desc(description, svc_lower, detected_os):
             )
             if not mentions_vista_plus:
                 return False, "CVE targets only legacy Windows versions"
+
+    if "x11" in svc_lower or "x display" in svc_lower:
+        if not _DESC_X11_SERVER.search(desc):
+            return False, "non-X11-server CVE on X11 port (by description)"
 
     return True, "no CPE data, passed description check"
 
