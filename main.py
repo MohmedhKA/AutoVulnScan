@@ -26,7 +26,7 @@ from scanner.network_sweep import run_network_sweep
 from scanner.service_id import run_service_id
 from scanner.os_detect import detect_os_version
 from cve_lookup.nvd_api import load_api_key
-from cve_lookup.cve_match import match_cves
+from cve_lookup.cve_match import match_cves, deduplicate_cve_results
 from exploits.validator import run_validators
 from report.generate import generate_report
 
@@ -602,11 +602,9 @@ def page_pipeline(target_ip, port_start, port_end, stealth_key):
     api_key = Settings.api_key or load_api_key()
     cve_results, _ = run_captured(match_cves, services, api_key=api_key, os_info=os_info)
     scan_data["cve_results"] = cve_results
+    scan_data["deduplicated_cves"] = deduplicate_cve_results(cve_results)
 
-    all_cves = []
-    for pd in cve_results.values():
-        if isinstance(pd, dict):
-            all_cves.extend(pd.get("cves", []))
+    all_cves = scan_data["deduplicated_cves"]
     crit = len([c for c in all_cves if c.get("severity")=="CRITICAL"])
     high = len([c for c in all_cves if c.get("severity")=="HIGH"])
 
@@ -684,10 +682,9 @@ def page_results(scan_data):
         elif of != "unknown":
             os_display = of.capitalize()
 
-    all_cves = []
-    for pd in cve_res.values():
-        if isinstance(pd, dict):
-            all_cves.extend(pd.get("cves", []))
+    all_cves = scan_data.get("deduplicated_cves")
+    if all_cves is None:
+        all_cves = deduplicate_cve_results(cve_res)
     n_crit = len([c for c in all_cves if c.get("severity")=="CRITICAL"])
     n_high = len([c for c in all_cves if c.get("severity")=="HIGH"])
     n_conf = len([v for v in val.values() if v.get("status")=="CONFIRMED"])
@@ -767,7 +764,10 @@ def page_save(scan_data):
     out = text_prompt("Output directory", "reports")
 
     print()
-    reports = generate_report(scan_data, out)
+    deduplicated_cves = scan_data.get("deduplicated_cves")
+    if deduplicated_cves is None:
+        deduplicated_cves = deduplicate_cve_results(scan_data.get("cve_results", {}))
+    reports = generate_report(scan_data, out, deduplicated_cves=deduplicated_cves)
     print()
 
     if reports.get("html"):

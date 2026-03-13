@@ -255,7 +255,7 @@ def _status_badge(status):
     return '<span class="badge not-confirmed">NOT CONFIRMED</span>'
 
 
-def generate_html_report(scan_data, output_path):
+def generate_html_report(scan_data, output_path, deduplicated_cves=None):
     """
     Generate a professional dark-themed HTML vulnerability report.
 
@@ -267,8 +267,9 @@ def generate_html_report(scan_data, output_path):
     - Scan metadata (target, time, stealth level)
 
     Args:
-        scan_data (dict):  All scan results
-        output_path (str): Full path to write the HTML file
+        scan_data (dict):          All scan results
+        output_path (str):         Full path to write the HTML file
+        deduplicated_cves (list):  Unique CVE list with merged 'ports' field
 
     Returns:
         str: Path to the written file
@@ -280,7 +281,6 @@ def generate_html_report(scan_data, output_path):
     duration = scan_data.get("duration", "Unknown")
     open_ports = scan_data.get("open_ports", [])
     services = scan_data.get("services", {})
-    cve_results = scan_data.get("cve_results", {})
     validation = scan_data.get("validation_results", {})
     os_info = scan_data.get("os_info", {})
 
@@ -301,36 +301,12 @@ def generate_html_report(scan_data, output_path):
     total_ports = len(open_ports)
     total_services = len([s for s in services.values() if s != "Unknown"])
 
-    # Build CVE views:
-    # 1) port-level rows (raw findings)
-    # 2) unique CVEs grouped across ports (clearer summary)
-    cve_entries = []
-    unique_cves = {}  # {cve_id: {"cve": {}, "ports": set(), "sources": set()}}
+    # Deduplicated CVEs are produced by cve_match.deduplicate_cve_results()
+    # and passed in by main.py/generate_report().
+    if deduplicated_cves is None:
+        deduplicated_cves = scan_data.get("deduplicated_cves", [])
 
-    for port_key in sorted(cve_results.keys(), key=lambda x: int(x)):
-        port_data = cve_results[port_key]
-        if not isinstance(port_data, dict):
-            continue
-
-        is_internal_kb = port_data.get("using_internal_kb", False)
-        query_method = port_data.get("query_method", "keyword")
-        source_label = "Internal KB" if is_internal_kb else (
-            "NVD (CPE)" if query_method == "cpe" else "NVD"
-        )
-
-        for cve in port_data.get("cves", []):
-            cve_entries.append((str(port_key), cve, source_label))
-            cve_id = cve.get("id", "Unknown")
-            if cve_id not in unique_cves:
-                unique_cves[cve_id] = {
-                    "cve": dict(cve),
-                    "ports": set(),
-                    "sources": set(),
-                }
-            unique_cves[cve_id]["ports"].add(str(port_key))
-            unique_cves[cve_id]["sources"].add(str(cve.get("source", source_label)))
-
-    all_cves = [entry["cve"] for entry in unique_cves.values()]
+    all_cves = deduplicated_cves
     critical_count = len([c for c in all_cves if c.get("severity") == "CRITICAL"])
     high_count = len([c for c in all_cves if c.get("severity") == "HIGH"])
     medium_count = len([c for c in all_cves if c.get("severity") in ("MEDIUM", "MODERATE")])
@@ -449,14 +425,13 @@ def generate_html_report(scan_data, output_path):
                 </tr>
 """)
 
-        for cve_id in sorted(unique_cves.keys()):
-            row = unique_cves[cve_id]
-            cve = row["cve"]
+        for cve in sorted(all_cves, key=lambda c: (-float(c.get("cvss", 0)), str(c.get("id", "")))):
+            cve_id = cve.get("id", "Unknown")
             cvss = cve.get("cvss", 0)
             severity = cve.get("severity", "UNKNOWN")
             desc = cve.get("description", "No description")
-            ports = sorted(row["ports"], key=lambda x: int(x))
-            source = ", ".join(sorted(row["sources"]))
+            ports = cve.get("ports", [])
+            source = cve.get("source", "NVD")
 
             # Check if this CVE was validated
             val_status = "—"
@@ -469,7 +444,7 @@ def generate_html_report(scan_data, output_path):
 
             parts.append(f"""
                 <tr>
-                    <td><span class="port-num">{html.escape(', '.join(ports))}</span></td>
+                    <td><span class="port-num">{html.escape(', '.join(str(p) for p in ports))}</span></td>
                     <td><span class="cve-id">{html.escape(cve_id)}</span></td>
                     <td><span class="cvss-score {_cvss_class(cvss)}">{cvss}</span></td>
                     <td>{_severity_badge(severity)}</td>
@@ -553,7 +528,7 @@ def generate_html_report(scan_data, output_path):
 # MAIN REPORT GENERATOR
 # ============================================================
 
-def generate_report(scan_data, output_dir="."):
+def generate_report(scan_data, output_dir=".", deduplicated_cves=None):
     """
     Generate both JSON and HTML reports.
 
@@ -561,8 +536,9 @@ def generate_report(scan_data, output_dir="."):
     It creates both report files in the specified directory.
 
     Args:
-        scan_data (dict):   All scan results from the scan pipeline
-        output_dir (str):   Directory to save reports in
+        scan_data (dict):          All scan results from the scan pipeline
+        output_dir (str):          Directory to save reports in
+        deduplicated_cves (list):  Optional unique CVE list with merged ports
 
     Returns:
         dict: {"json": json_path, "html": html_path}
@@ -582,8 +558,15 @@ def generate_report(scan_data, output_dir="."):
 
     print(f"\n[*] Generating reports...")
 
+    if deduplicated_cves is None:
+        deduplicated_cves = scan_data.get("deduplicated_cves", [])
+
     json_result = generate_json_report(scan_data, json_path)
-    html_result = generate_html_report(scan_data, html_path)
+    html_result = generate_html_report(
+        scan_data,
+        html_path,
+        deduplicated_cves=deduplicated_cves,
+    )
 
     return {
         "json": json_result,

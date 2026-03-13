@@ -216,6 +216,22 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
         # CVSS threshold filter
         filtered_cves = [c for c in applicable if c.get("cvss", 0) >= min_cvss]
 
+        # Modern Windows patch-state filter (internal KB signal)
+        # If a CVE is marked patched_in_modern=True and the detected OS generation
+        # is modern, we skip it from actionable findings.
+        if os_info and os_info.get("os_gen") == "modern":
+            remaining_cves = []
+            for cve in filtered_cves:
+                if cve.get("patched_in_modern"):
+                    cve["applicability_note"] = "PATCHED - already fixed in modern Windows"
+                    print(f"  [~] Port {port}: {cve.get('id', 'UNKNOWN')} skipped (patched in modern Windows)")
+                    cve_copy = dict(cve)
+                    cve_copy["filter_reason"] = "patched in modern Windows"
+                    filtered_out.append(cve_copy)
+                    continue
+                remaining_cves.append(cve)
+            filtered_cves = remaining_cves
+
         results[port] = {
             "service": service_string,
             "cves": filtered_cves,
@@ -254,6 +270,71 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
         print()
 
     return results
+
+
+# ============================================================
+# CVE RESULT HELPERS
+# ============================================================
+
+def deduplicate_cve_results(cve_results: dict) -> list:
+    """
+    Flatten all CVEs from all ports into a single deduplicated list.
+    When the same CVE appears on multiple ports, merge the port numbers
+    into a 'ports' field e.g. [139, 445].
+    Returns list of unique CVE dicts, each with a 'ports' field.
+    """
+    if not cve_results:
+        return []
+
+    unique = {}
+
+    def _port_sort_key(val):
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 999999
+
+    for port_key in sorted(cve_results.keys(), key=_port_sort_key):
+        port_data = cve_results[port_key]
+        if not isinstance(port_data, dict):
+            continue
+
+        is_internal_kb = port_data.get("using_internal_kb", False)
+        query_method = port_data.get("query_method", "keyword")
+        source_label = "internal_kb" if is_internal_kb else (
+            "NVD (CPE)" if query_method == "cpe" else "NVD"
+        )
+
+        try:
+            port_num = int(port_key)
+        except (TypeError, ValueError):
+            port_num = port_key
+
+        for cve in port_data.get("cves", []):
+            cve_id = cve.get("id", "UNKNOWN")
+            if cve_id not in unique:
+                merged = dict(cve)
+                merged["ports"] = [port_num]
+                if not merged.get("source"):
+                    merged["source"] = source_label
+                unique[cve_id] = merged
+                continue
+
+            if port_num not in unique[cve_id]["ports"]:
+                unique[cve_id]["ports"].append(port_num)
+
+    def _mixed_sort_key(val):
+        if isinstance(val, int):
+            return (0, val)
+        sval = str(val)
+        return (0, int(sval)) if sval.isdigit() else (1, sval)
+
+    deduped = list(unique.values())
+    for cve in deduped:
+        cve["ports"] = sorted(cve.get("ports", []), key=_mixed_sort_key)
+
+    deduped.sort(key=lambda c: (-float(c.get("cvss", 0)), str(c.get("id", ""))))
+    return deduped
 
 
 # ============================================================
