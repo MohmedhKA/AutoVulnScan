@@ -301,17 +301,39 @@ def generate_html_report(scan_data, output_path):
     total_ports = len(open_ports)
     total_services = len([s for s in services.values() if s != "Unknown"])
 
-    # Count CVEs by severity
-    all_cves = []
-    for port_data in cve_results.values():
-        if isinstance(port_data, dict):
-            for cve in port_data.get("cves", []):
-                all_cves.append(cve)
+    # Build CVE views:
+    # 1) port-level rows (raw findings)
+    # 2) unique CVEs grouped across ports (clearer summary)
+    cve_entries = []
+    unique_cves = {}  # {cve_id: {"cve": {}, "ports": set(), "sources": set()}}
 
+    for port_key in sorted(cve_results.keys(), key=lambda x: int(x)):
+        port_data = cve_results[port_key]
+        if not isinstance(port_data, dict):
+            continue
+
+        is_internal_kb = port_data.get("using_internal_kb", False)
+        query_method = port_data.get("query_method", "keyword")
+        source_label = "Internal KB" if is_internal_kb else (
+            "NVD (CPE)" if query_method == "cpe" else "NVD"
+        )
+
+        for cve in port_data.get("cves", []):
+            cve_entries.append((str(port_key), cve, source_label))
+            cve_id = cve.get("id", "Unknown")
+            if cve_id not in unique_cves:
+                unique_cves[cve_id] = {
+                    "cve": dict(cve),
+                    "ports": set(),
+                    "sources": set(),
+                }
+            unique_cves[cve_id]["ports"].add(str(port_key))
+            unique_cves[cve_id]["sources"].add(str(cve.get("source", source_label)))
+
+    all_cves = [entry["cve"] for entry in unique_cves.values()]
     critical_count = len([c for c in all_cves if c.get("severity") == "CRITICAL"])
     high_count = len([c for c in all_cves if c.get("severity") == "HIGH"])
-    medium_count = len([c for c in all_cves
-                        if c.get("severity") in ("MEDIUM", "MODERATE")])
+    medium_count = len([c for c in all_cves if c.get("severity") in ("MEDIUM", "MODERATE")])
     confirmed_count = len([v for v in validation.values()
                            if v.get("status") == "CONFIRMED"])
 
@@ -409,7 +431,7 @@ def generate_html_report(scan_data, output_path):
     </div>
 """)
 
-    # CVE Findings table
+    # CVE Findings table (unique CVEs grouped by affected ports)
     if all_cves:
         parts.append("""
     <div class="section">
@@ -417,7 +439,7 @@ def generate_html_report(scan_data, output_path):
         <div class="section-body">
             <table>
                 <tr>
-                    <th>Port</th>
+                    <th>Ports</th>
                     <th>CVE ID</th>
                     <th>CVSS</th>
                     <th>Severity</th>
@@ -427,43 +449,31 @@ def generate_html_report(scan_data, output_path):
                 </tr>
 """)
 
-        for port_key in sorted(cve_results.keys(), key=lambda x: int(x)):
-            port_data = cve_results[port_key]
-            if not isinstance(port_data, dict):
-                continue
+        for cve_id in sorted(unique_cves.keys()):
+            row = unique_cves[cve_id]
+            cve = row["cve"]
+            cvss = cve.get("cvss", 0)
+            severity = cve.get("severity", "UNKNOWN")
+            desc = cve.get("description", "No description")
+            ports = sorted(row["ports"], key=lambda x: int(x))
+            source = ", ".join(sorted(row["sources"]))
 
-            # Determine data source for this port
-            is_internal_kb = port_data.get("using_internal_kb", False)
-            query_method = port_data.get("query_method", "keyword")
-            source_label = "Internal KB" if is_internal_kb else (
-                "NVD (CPE)" if query_method == "cpe" else "NVD"
-            )
+            # Check if this CVE was validated
+            val_status = "—"
+            if cve_id in validation:
+                val_status = _status_badge(validation[cve_id].get("status", ""))
 
-            for cve in port_data.get("cves", []):
-                cve_id = cve.get("id", "Unknown")
-                cvss = cve.get("cvss", 0)
-                severity = cve.get("severity", "UNKNOWN")
-                desc = cve.get("description", "No description")
+            # Truncate description for display
+            if len(desc) > 150:
+                desc = desc[:150] + "..."
 
-                # Check if this CVE was validated
-                val_status = "—"
-                if cve_id in validation:
-                    val_status = _status_badge(validation[cve_id].get("status", ""))
-
-                # Truncate description for display
-                if len(desc) > 150:
-                    desc = desc[:150] + "..."
-
-                # Use per-CVE source if available, else port-level source
-                cve_source = cve.get("source", source_label)
-
-                parts.append(f"""
+            parts.append(f"""
                 <tr>
-                    <td><span class="port-num">{port_key}</span></td>
+                    <td><span class="port-num">{html.escape(', '.join(ports))}</span></td>
                     <td><span class="cve-id">{html.escape(cve_id)}</span></td>
                     <td><span class="cvss-score {_cvss_class(cvss)}">{cvss}</span></td>
                     <td>{_severity_badge(severity)}</td>
-                    <td><span class="description">{html.escape(str(cve_source))}</span></td>
+                    <td><span class="description">{html.escape(str(source))}</span></td>
                     <td>{val_status}</td>
                     <td><span class="description">{html.escape(desc)}</span></td>
                 </tr>""")

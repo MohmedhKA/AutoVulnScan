@@ -169,8 +169,10 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
                 keyword = None
                 if is_smb:
                     keyword = "SMB"
-                elif is_os_service:
-                    keyword = None  # OS CPE alone is sufficient
+                elif "rpc" in service_string.lower():
+                    keyword = "RPC"
+                elif "netbios" in service_string.lower():
+                    keyword = "NetBIOS"
 
                 all_cves = query_nvd_by_cpe(cpe_string, keyword_filter=keyword,
                                              api_key=api_key)

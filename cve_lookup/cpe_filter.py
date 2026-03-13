@@ -204,6 +204,44 @@ _DESC_MODERN_WINDOWS = re.compile(
     r'\b(windows\s+(10|11|server\s+201[6-9]|server\s+202[0-9]))\b', re.I
 )
 
+# Service-topic relevance patterns
+_DESC_SMB_TOPIC = re.compile(
+    r'\b(smb(?:v\d+(?:\.\d+)*)?|server\s+message\s+block|cifs|netbios)\b', re.I
+)
+_DESC_RPC_TOPIC = re.compile(
+    r'\b(rpc|remote\s+procedure\s+call|msrpc|dcom)\b', re.I
+)
+
+
+def _is_service_relevant(cpe_list, description, svc_lower):
+    """
+    Ensure CVE topic matches the scanned service, not just the OS platform.
+
+    Example false positive this blocks:
+      service = "Microsoft Windows RPC"
+      CVE    = "Windows Encrypting File System RCE"
+    """
+    desc = description or ""
+    _, _, products = _vendors_products(cpe_list) if cpe_list else (set(), set(), set())
+
+    # SMB / NetBIOS ports should only keep SMB-related CVEs.
+    if "smb" in svc_lower or "netbios" in svc_lower:
+        if _DESC_SMB_TOPIC.search(desc):
+            return True, "service-topic matches SMB/NetBIOS"
+        if any("smb" in p or "netbios" in p for p in products):
+            return True, "service-topic matches SMB/NetBIOS (by CPE product)"
+        return False, "CVE not related to SMB/NetBIOS service"
+
+    # RPC (port 135) should only keep RPC/DCOM-related CVEs.
+    if "rpc" in svc_lower:
+        if _DESC_RPC_TOPIC.search(desc):
+            return True, "service-topic matches RPC"
+        if any("rpc" in p or "dcom" in p for p in products):
+            return True, "service-topic matches RPC (by CPE product)"
+        return False, "CVE not related to RPC service"
+
+    return True, "service-topic check not needed"
+
 
 def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os):
     """Check CPE data for platform relevance. Returns (ok, reason) or None."""
@@ -393,7 +431,12 @@ def is_cve_applicable(cve, service_name, service_version, detected_os):
         if not ok:
             return False, reason
 
-    # 3. Version range check
+    # 3. Service-topic check (avoid generic OS CVEs on SMB/RPC ports)
+    ok, reason = _is_service_relevant(cpe_list, description, svc_lower)
+    if not ok:
+        return False, reason
+
+    # 4. Version range check
     ok, reason = is_version_relevant(cpe_list, service_version)
     if not ok:
         return False, reason
