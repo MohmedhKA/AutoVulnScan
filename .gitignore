@@ -5,6 +5,7 @@
 # ---- SECRETS — NEVER COMMIT THESE ----
 .env
 api.txt
+MyPlan.md
 
 # ---- GENERATED SCAN REPORTS ----
 scan_*.html
