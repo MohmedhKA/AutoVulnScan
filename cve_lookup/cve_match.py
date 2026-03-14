@@ -45,8 +45,53 @@ KNOWN_SERVICE_VERSIONS = {
     "postgresql": "8.3.1",
     "nfs": "",
     "rpcbind": "0.2.0",
-    "ajp": "5.5.0",
+    "ajp": "5.5.12",
+    "unrealircd": "3.2.8.1",
 }
+
+# Service version overrides: map a normalized service string to the *software*
+# version when the banner only contains a protocol version, not the software
+# version.  This is needed because service_id.py may report "SMB 1.0" (the
+# SMB dialect) for a host running "Samba 3.0.20" (the actual software).
+# Keys are lowercase-stripped service strings as they appear in the service map.
+SERVICE_VERSION_OVERRIDES = {
+    # Metasploitable 2: Samba 3.0.20 on Linux reports SMB dialect 1.0
+    "smb 1.0":              "3.0.20",
+    "smb1":                 "3.0.20",
+    "netbios-ssn (smb 1.0)": "3.0.20",
+    "netbios-ssn":          "3.0.20",
+}
+
+
+def _resolve_svc_version(svc_name: str, svc_ver: str, service_string: str) -> str:
+    """
+    Return the best available version string for KB bounds checking.
+
+    Priority:
+      1. Version extracted by service_id (svc_ver) — only if it is NOT a
+         well-known protocol dialect that would mislead version bounds.
+         For SMB the dialect ("1.0", "2.0", "3.1.1") is NOT the Samba
+         software version; we override it using SERVICE_VERSION_OVERRIDES.
+      2. SERVICE_VERSION_OVERRIDES keyed on the full service string.
+      3. KNOWN_SERVICE_VERSIONS keyed on the service name.
+      4. Empty string (version unknown).
+    """
+    # Check full service string override first (e.g. "SMB 1.0" -> "3.0.20")
+    key_full = service_string.lower().strip()
+    if key_full in SERVICE_VERSION_OVERRIDES:
+        return SERVICE_VERSION_OVERRIDES[key_full]
+
+    # Check service name override
+    key_name = svc_name.lower().strip()
+    if key_name in SERVICE_VERSION_OVERRIDES:
+        return SERVICE_VERSION_OVERRIDES[key_name]
+
+    # Use extracted version if present and not overridden
+    if svc_ver:
+        return svc_ver
+
+    # Fall back to KNOWN_SERVICE_VERSIONS
+    return KNOWN_SERVICE_VERSIONS.get(key_name, "")
 
 
 # ============================================================
@@ -57,7 +102,9 @@ KNOWN_SERVICE_VERSIONS = {
 MIN_CVSS_SCORE = 7.0
 
 # Delay between NVD API queries (seconds)
-QUERY_DELAY = 6
+# CIRCL has no hard rate limit; 1 s is enough to be polite.
+# (Old value was 6 s — required only for the legacy NVD v2 API.)
+QUERY_DELAY = 1
 
 # Services to skip (generic names that produce too many irrelevant results)
 # These are handled by OS-level CVE lookup instead
@@ -349,7 +396,17 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
 
         if (quality < QUALITY_THRESHOLD and all_cves) or (not all_cves and query_method != "none"):
             svc_name, svc_ver = parse_service_version(service_string)
-            kb_cves = lookup_known_cves(svc_name, svc_ver, detected_os)
+
+            # Resolve the best available version — handles SMB dialect vs. Samba
+            # software version mismatch and other protocol/software version gaps.
+            resolved_ver = _resolve_svc_version(svc_name, svc_ver, service_string)
+            if resolved_ver != svc_ver:
+                print(f"  [*] Port {port}: version override '{svc_ver}' → '{resolved_ver}' for '{svc_name}'")
+            elif not svc_ver and resolved_ver:
+                print(f"  [*] Port {port}: using known version fallback '{resolved_ver}' for '{svc_name}'")
+            svc_ver = resolved_ver
+
+            kb_cves = lookup_known_cves(service_string, "", detected_os)
 
             # Enforce internal KB version bounds to avoid false positives
             # (e.g., OpenSSH 4.7p1 should not match CVE-2024-6387).
@@ -376,12 +433,8 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
 
         # ---- FILTERING ----
         svc_name, svc_ver = parse_service_version(service_string)
-        # If version was not detected by service_id.py, use known fallback
-        if not svc_ver:
-            fallback_key = svc_name.lower().strip()
-            svc_ver = KNOWN_SERVICE_VERSIONS.get(fallback_key, "")
-            if svc_ver:
-                print(f"  [*] Port {port}: using known version fallback '{svc_ver}' for '{svc_name}'")
+        # Resolve version (handles SMB dialect vs. software version, fallbacks)
+        svc_ver = _resolve_svc_version(svc_name, svc_ver, service_string)
         applicable, filtered_out = filter_cves(
             all_cves,
             svc_name,

@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=flat-square&logo=python&logoColor=white" alt="Python 3.8+">
   <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-lightgrey?style=flat-square" alt="Platform Windows and Linux">
-  <img src="https://img.shields.io/badge/NVD%20API-NIST%20v2.0-orange?style=flat-square" alt="NVD API NIST v2.0">
+  <img src="https://img.shields.io/badge/CVE%20Source-CIRCL%20%2F%20VulnCheck-orange?style=flat-square" alt="CVE Source: CIRCL / VulnCheck">
   <img src="https://img.shields.io/badge/Use-Educational%20Only-red?style=flat-square" alt="Educational use only">
 </p>
 
@@ -19,7 +19,7 @@
 
 ## Overview
 
-AutoVulnScan automates a practical vulnerability assessment workflow from a single terminal interface. It performs host discovery, port scanning, service and OS fingerprinting, CVE correlation against the NIST NVD, optional exploit validation, and produces clean HTML and JSON reports — all without installing Nmap or any binary dependencies.
+AutoVulnScan automates a practical vulnerability assessment workflow from a single terminal interface. It performs host discovery, port scanning, service and OS fingerprinting, CVE correlation against public databases, optional exploit validation, and produces clean HTML and JSON reports — all without installing Nmap or any binary dependencies.
 
 The interface is a **page-based TUI** with full arrow-key navigation, not a flags-driven CLI.
 
@@ -40,7 +40,7 @@ Host Discovery (optional)
   OS Detection  ───────────────────────────── SMB negotiate handshake
       │
       ▼
-  CVE Matching  ───────────────────────────── NVD CPE → keyword → internal KB
+  CVE Matching  ───────────────────────────── CIRCL → VulnCheck → internal KB
       │
       ▼
   Exploit Validation  ─────────────────────── non-destructive checks only
@@ -84,22 +84,49 @@ Standard banner grabbing fails on Windows RPC/SMB/NetBIOS. AutoVulnScan uses pro
 
 `cve_lookup/cve_match.py` applies a layered matching strategy:
 
-1. **NVD CPE query** — most precise, fewest false positives
-2. **NVD keyword query** — broader fallback for unrecognized services
-3. **Internal curated KB** (`known_cves.py`) — when API quality is low or rate-limited
+1. **CIRCL CVE Search** (`cve.circl.lu`) — primary source, no API key required  
+   Queries `GET /api/search/{vendor}/{product}` using CPE mappings for well-known services.
+2. **VulnCheck NVD++** — fallback when CIRCL fails, times out, or returns empty results  
+   Token-authenticated. Returns NVD v2.0-compatible JSON.
+3. **Internal curated KB** (`known_cves.py`) — final fallback  
+   Used when both APIs are unreachable or return low-quality results. Always accurate; curated per service/version/OS.
 
 Supporting components:
 
 - **`cve_lookup/cpe_filter.py`**: filters raw CVE candidates by platform relevance, service topic relevance, and version-range relevance to reduce noisy matches.
-- **`cve_lookup/known_cves.py`**: internal curated knowledge base used when NVD responses are weak, missing, or overly broad for practical service-level matching.
+- **`cve_lookup/known_cves.py`**: internal curated knowledge base used when API responses are weak, missing, or overly broad for practical service-level matching.
 
 Each result then passes through:
 
 - Platform relevance filtering via `cpe_filter.py`
 - Service-topic checks (SMB, RPC, NetBIOS topic gating)
 - Version range filtering where CPE range data is available
-- CVSS threshold gate (`>= 7.0` by default)
+- CVSS threshold gate (`>= 7.0` by default; `0.0` passes through as unknown severity)
+- **Protocol/software version resolution** — e.g. SMB dialect `"1.0"` is recognized as Samba `3.0.20` for correct CVE bounds checking
 - **Modern patch-state suppression** — CVEs flagged `patched_in_modern=true` are suppressed when the detected OS generation is `modern`
+
+### Internal KB Coverage (as of current version)
+
+The internal KB covers the following services against Metasploitable 2 and common Linux/Windows targets:
+
+| Service | CVE | CVSS | Notes |
+|---------|-----|------|-------|
+| vsftpd 2.3.4 | CVE-2011-2523 | 9.8 | Backdoor |
+| Samba 3.0.0–3.0.25 | CVE-2007-2447 | 10.0 | Username map script RCE |
+| Samba 3.5.0–4.6.3 | CVE-2017-7494 | 9.8 | SambaCry |
+| Apache HTTP 2.2–2.4.27 | CVE-2017-9798 | 7.5 | Optionsbleed |
+| Apache HTTP 2.4.49 | CVE-2021-41773 | 7.5 | Path traversal |
+| Apache Tomcat (AJP) | CVE-2020-1938 | 9.8 | Ghostcat |
+| MySQL 5.1–5.5.23 | CVE-2012-2122 | 7.5 | Auth bypass |
+| PostgreSQL 8.3–11.2 | CVE-2019-9193 | 9.0 | COPY PROGRAM RCE |
+| Java RMI ≤ 1.6.27 | CVE-2011-3521 | 10.0 | Deserialization RCE |
+| UnrealIRCd 3.2.8.1 | CVE-2010-2075 | 10.0 | Backdoor |
+| distccd | CVE-2004-2687 | 9.3 | Arbitrary command exec |
+| NFS (no_root_squash) | CVE-2019-12255 | 9.8 | Root file access |
+| OpenSSH 8.5p1–9.7p1 | CVE-2024-6387 | 8.1 | regreSSHion |
+| Windows SMB 1.0 | CVE-2017-0144 | 8.1 | EternalBlue |
+| Windows SMB 3.1.1 | CVE-2020-0796 | 10.0 | SMBGhost |
+| Windows RPC | CVE-2022-26809 | 9.8 | RCE via RPC |
 
 ### Deduplicated Reporting
 
@@ -171,7 +198,11 @@ On Docker Desktop, host networking behavior can differ by platform/version. If n
 
 ## Configuration
 
-### NVD API Key
+### CVE API Setup
+
+The scanner uses **CIRCL CVE Search** as its primary CVE source — no API key required. If CIRCL fails (timeout, HTTP error, or empty results), the scanner automatically falls back to **VulnCheck NVD++**, which requires a free token.
+
+**To configure the VulnCheck fallback token:**
 
 ```bash
 cp .env.example .env
@@ -180,17 +211,17 @@ cp .env.example .env
 Edit `.env`:
 
 ```env
-NVD_API_KEY=your_key_here
+VULNCHECK_TOKEN=your_token_here
 ```
 
-Obtain a free key at [nvd.nist.gov/developers/request-an-api-key](https://nvd.nist.gov/developers/request-an-api-key).
+Obtain a free token at [vulncheck.com](https://vulncheck.com).
 
-Key resolution order:
+Token resolution order:
 
-1. `NVD_API_KEY` from environment or `.env`
-2. `api.txt` (legacy fallback)
+1. `VULNCHECK_TOKEN` from `.env` (recommended)
+2. `api.txt` in the project root (deprecated — prints a migration warning)
 
-If the key is rejected with `403` or `404`, the scanner automatically retries in unauthenticated mode (rate-limited to 5 requests / 30 s).
+If VulnCheck is not configured or returns an error, the scanner falls back entirely to the **internal knowledge base** (`known_cves.py`), which covers the most common vulnerable services out of the box.
 
 ---
 
@@ -282,11 +313,11 @@ AutoVulnScan/
 ├── scanner/
 │   ├── network_sweep.py      # TCP-based host discovery
 │   ├── port_scan.py          # Stealth port scanner
-│   ├── service_id.py         # Protocol-aware banner grabbing
+│   ├── service_id.py         # Protocol-aware banner grabbing + MySQL/RFB/Tomcat detection
 │   └── os_detect.py          # SMB OS fingerprinting
 ├── cve_lookup/
-│   ├── nvd_api.py            # NIST NVD API client
-│   ├── cve_match.py          # Multi-strategy CVE matching
+│   ├── nvd_api.py            # CIRCL primary + VulnCheck NVD++ fallback client
+│   ├── cve_match.py          # Multi-strategy CVE matching with version overrides
 │   ├── cpe_filter.py         # CPE-based relevance filtering
 │   └── known_cves.py         # Internal curated CVE knowledge base
 ├── exploits/

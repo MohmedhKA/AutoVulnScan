@@ -64,6 +64,11 @@ PROTOCOL_PROBES = {
     8443: b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n",
     8000: b"HEAD / HTTP/1.0\r\nHost: target\r\n\r\n",
 
+    # Port 8180 is Apache Tomcat's alternate HTTP port on Metasploitable2.
+    # A GET request returns the Tomcat welcome page which contains "Tomcat".
+    # HEAD returns minimal headers without page body, so use GET here.
+    8180: b"GET / HTTP/1.0\r\nHost: target\r\n\r\n",
+
     # For anything else, a bare carriage-return-line-feed
     # Many text-based protocols respond to this
     "default": b"\r\n",
@@ -79,6 +84,13 @@ PROTOCOL_PROBES = {
 SERVICE_SIGNATURES = [
     # (search_string, service_name)
     # Check these in order - first match wins
+
+    # Tomcat MUST appear before "Apache" to prevent Tomcat HTTP responses
+    # (which contain both "Apache-Coyote" and "Apache") from matching as
+    # "Apache HTTP" instead of "Apache Tomcat".
+    ("Apache-Coyote", "Apache Tomcat"),
+    ("Tomcat",        "Apache Tomcat"),
+
     ("vsftpd",      "vsftpd"),
     ("FileZilla",   "FileZilla FTP"),
     ("ProFTPD",     "ProFTPD"),
@@ -101,6 +113,9 @@ SERVICE_SIGNATURES = [
     ("Dovecot",     "Dovecot"),
     ("Courier",     "Courier"),
     ("OpenLDAP",    "OpenLDAP"),
+    # RFB is the Remote Framebuffer protocol used by VNC.
+    # "RFB 003.003" is the exact banner sent by VNC on port 5900.
+    ("RFB",         "VNC"),
     ("VNC",         "VNC"),
     ("RDP",         "RDP"),
     ("Telnet",      "Telnet"),
@@ -110,7 +125,6 @@ SERVICE_SIGNATURES = [
     ("Java RMI",    "Java RMI"),
     ("rmiregistry", "Java RMI"),
     ("Jetty",       "Jetty HTTP"),
-    ("Tomcat",      "Apache Tomcat"),
     ("PHP",         "PHP"),
     ("X11",         "X11"),
 ]
@@ -372,6 +386,18 @@ def identify_service(banner_text, port):
     if not banner_text:
         # No banner received - use port-based guess as fallback
         return PORT_SERVICE_NAMES.get(port, "Unknown")
+
+    # MySQL sends a binary protocol greeting on port 3306.
+    # The word "MySQL" never appears in the raw banner; instead the server
+    # sends: <4-byte packet header> <0x0a protocol version> <null-terminated
+    # version string> <null-terminated garbage>.  The version string IS
+    # present as printable ASCII digits/dots somewhere in the banner.
+    # We detect it by port number and extract the version with a regex.
+    if port == 3306:
+        m = re.search(r'(\d+\.\d+\.\d+[\w.-]*)', banner_text)
+        if m:
+            return f"MySQL {m.group(1)}"
+        return "MySQL"
 
     # UnrealIRCd-specific detection to avoid collapsing into generic "IRC".
     banner_lower = banner_text.lower()

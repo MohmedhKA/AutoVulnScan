@@ -245,6 +245,77 @@ KNOWN_CVE_DB = [
             "source": "internal_kb",
         },
     },
+    {
+        # Samba 3.0.x username map script command injection — THE classic
+        # Metasploitable 2 exploit (msf: multi/samba/usermap_script).
+        # Sending a shell metacharacter in the username field of a CIFS
+        # authentication request causes the server to execute the injected
+        # command as root with no authentication required.
+        "service_patterns": ["samba", "smb 1.0", "smb1", "netbios"],
+        "os_family": "linux",
+        "cve": {
+            "id": "CVE-2007-2447",
+            "cvss": 10.0,
+            "severity": "CRITICAL",
+            "description": (
+                "Samba 3.0.0 through 3.0.25rc3 — username map script command "
+                "injection. The MS-RPC functionality in smbd allows remote "
+                "attackers to execute arbitrary commands via shell metacharacters "
+                "in a username in a SAMR pipe. Exploitable without authentication; "
+                "gives a root shell."
+            ),
+            "affected": "Samba 3.0.0 through 3.0.25rc3 (Linux/Unix)",
+            "min_version": "3.0.0",
+            "max_version": "3.0.25",
+            "remediation": "Update Samba to 3.0.25 final (patched) or any later version.",
+            "year": 2007,
+            "smb_versions": [],
+            "patched_in_modern": True,
+            "source": "internal_kb",
+        },
+    },
+
+    # ================================================================
+    # Apache Tomcat CVEs (ports 8009 AJP, 8080/8180 HTTP)
+    # ================================================================
+
+    {
+        # Ghostcat — Apache Tomcat AJP file read / remote code execution.
+        # The AJP connector (default port 8009) is enabled by default in
+        # Tomcat ≤ 9.0.30 / 8.5.50 / 7.0.99.  An unauthenticated attacker
+        # can read any file from the webapp root (including WEB-INF/) or,
+        # if the server allows file upload, achieve remote code execution.
+        # Metasploitable2 runs Tomcat 5.5.12 with AJP exposed on port 8009.
+        "service_patterns": ["ajp", "apache tomcat", "tomcat"],
+        "os_family": "any",
+        "cve": {
+            "id": "CVE-2020-1938",
+            "cvss": 9.8,
+            "severity": "CRITICAL",
+            "description": (
+                "Ghostcat — Apache Tomcat AJP connector file read / include "
+                "vulnerability. When the AJP port (default 8009) is accessible, "
+                "a remote unauthenticated attacker can read files from within the "
+                "web application, including WEB-INF/web.xml and other sensitive "
+                "configuration files. If the application supports file upload, "
+                "this can be chained into remote code execution."
+            ),
+            "affected": (
+                "Apache Tomcat 6.x, 7.x before 7.0.100, "
+                "8.5.x before 8.5.51, 9.x before 9.0.31"
+            ),
+            "min_version": "5.0.0",
+            "remediation": (
+                "Upgrade to Tomcat 7.0.100+, 8.5.51+, or 9.0.31+. "
+                "If upgrade is not possible, disable or restrict the AJP connector "
+                "in server.xml (set address='127.0.0.1' or comment out the connector)."
+            ),
+            "year": 2020,
+            "smb_versions": [],
+            "patched_in_modern": False,
+            "source": "internal_kb",
+        },
+    },
 
     # ================================================================
     # vsftpd CVEs
@@ -354,7 +425,10 @@ KNOWN_CVE_DB = [
         },
     },
     {
-        "service_patterns": ["apache 2.2"],
+        # Pattern is "apache" not "apache 2.2" — service_id outputs
+        # "Apache HTTP 2.2.8" which does not contain the literal substring
+        # "apache 2.2".  Version bounds below enforce the 2.2.x/2.4.x range.
+        "service_patterns": ["apache"],
         "os_family": "any",
         "cve": {
             "id": "CVE-2017-9798",
