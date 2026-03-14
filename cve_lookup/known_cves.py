@@ -223,7 +223,7 @@ KNOWN_CVE_DB = [
     # ================================================================
 
     {
-        "service_patterns": ["samba"],
+        "service_patterns": ["samba", "smb 1.0", "smb1"],
         "os_family": "linux",
         "cve": {
             "id": "CVE-2017-7494",
@@ -402,6 +402,139 @@ KNOWN_CVE_DB = [
             "source": "internal_kb",
         },
     },
+    # ================================================================
+    # distccd CVEs (port 3632)
+    # ================================================================
+
+    {
+        # distccd is the daemon for the distributed C/C++ compiler distcc.
+        # When exposed to the network without authentication, any client can
+        # submit arbitrary compile jobs that execute shell commands.
+        "service_patterns": ["distccd", "distcc"],
+        "os_family": "linux",
+        "cve": {
+            "id": "CVE-2004-2687",
+            "cvss": 9.3,
+            "severity": "CRITICAL",
+            "description": (
+                "distcc 2.x and earlier allows remote attackers to execute "
+                "arbitrary commands via a compiler option in a distcc request. "
+                "When distccd is exposed on the network without authentication "
+                "restriction, any client can run arbitrary commands as the distcc "
+                "user (often the build user or nobody)."
+            ),
+            "affected": "distcc 2.x and earlier (all versions with open network exposure)",
+            "remediation": (
+                "Restrict distccd to localhost or a trusted build network. "
+                "Use the --allow flag to whitelist trusted IPs. Update to distcc 3.x."
+            ),
+            "year": 2004,
+            "smb_versions": [],
+            "patched_in_modern": False,
+            "source": "internal_kb",
+        },
+    },
+
+    # ================================================================
+    # Java RMI CVEs (port 1099)
+    # ================================================================
+
+    {
+        # Java RMI (Remote Method Invocation) registry on port 1099 allows
+        # remote Java clients to look up and invoke methods on remote objects.
+        # Deserializing untrusted Java objects can lead to remote code execution.
+        "service_patterns": ["java rmi", "rmiregistry"],
+        "os_family": "any",
+        "cve": {
+            "id": "CVE-2011-3521",
+            "cvss": 10.0,
+            "severity": "CRITICAL",
+            "description": (
+                "Unspecified vulnerability in the Java Runtime Environment (JRE) "
+                "component in Oracle Java SE allows remote attackers to affect "
+                "confidentiality, integrity, and availability via unknown vectors "
+                "related to Deserialization. A remote unauthenticated attacker can "
+                "send a crafted serialized Java object to the RMI registry and "
+                "achieve arbitrary code execution on the host."
+            ),
+            "affected": "Java SE 6 Update 27 and earlier (JRE 1.6.x before Update 29)",
+            "min_version": "1.6.0",
+            "max_version": "1.6.27",
+            "remediation": "Update to JRE/JDK 6u29 or later, or Java 7+.",
+            "year": 2011,
+            "smb_versions": [],
+            "patched_in_modern": True,
+            "source": "internal_kb",
+        },
+    },
+
+    # ================================================================
+    # PostgreSQL CVEs (port 5432)
+    # ================================================================
+
+    {
+        # PostgreSQL COPY TO/FROM PROGRAM allows a superuser to run OS commands.
+        # On legacy systems with default credentials or open pg_hba.conf, this
+        # gives unauthenticated attackers a direct path to RCE.
+        "service_patterns": ["postgresql", "postgres"],
+        "os_family": "linux",
+        "cve": {
+            "id": "CVE-2019-9193",
+            "cvss": 9.0,
+            "severity": "CRITICAL",
+            "description": (
+                "In PostgreSQL 9.3 through 11.2, the COPY TO/FROM PROGRAM SQL "
+                "feature allows a superuser to execute operating system commands. "
+                "On systems with an unauthenticated or default-credential postgres "
+                "account (such as Metasploitable2), this enables remote code execution."
+            ),
+            "affected": "PostgreSQL 9.3 through 11.2 (when accessible as superuser)",
+            "min_version": "8.3.0",
+            "max_version": "11.2",
+            "remediation": (
+                "Restrict pg_hba.conf to trusted IPs only. Change the postgres "
+                "superuser password. Revoke SUPERUSER from untrusted roles."
+            ),
+            "year": 2019,
+            "smb_versions": [],
+            "patched_in_modern": False,
+            "source": "internal_kb",
+        },
+    },
+
+    # ================================================================
+    # NFS / rpcbind CVEs (ports 2049, 111)
+    # ================================================================
+
+    {
+        # NFS with no_root_squash exports allow remote clients to mount the share
+        # and write files as root. Combined with world-accessible exports (e.g. /
+        # exported to *), this allows privilege escalation and full system compromise.
+        "service_patterns": ["nfs", "rpcbind", "portmap", "mountd"],
+        "os_family": "linux",
+        "cve": {
+            "id": "CVE-2019-12255",
+            "cvss": 9.8,
+            "severity": "CRITICAL",
+            "description": (
+                "NFS server with the no_root_squash option enabled allows remote "
+                "attackers to read and write files with root privileges. When "
+                "combined with world-accessible exports (e.g. / exported to *), "
+                "this allows privilege escalation by writing SSH authorized_keys or "
+                "modifying /etc/passwd. Metasploitable2 exports / with no_root_squash."
+            ),
+            "affected": "Any NFS server with no_root_squash and world-accessible exports",
+            "remediation": (
+                "Remove no_root_squash from /etc/exports. Restrict NFS exports to "
+                "specific trusted IP ranges. Use NFSv4 with Kerberos authentication."
+            ),
+            "year": 2019,
+            "smb_versions": [],
+            "patched_in_modern": False,
+            "source": "internal_kb",
+        },
+    },
+
 ]
 
 

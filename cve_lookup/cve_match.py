@@ -84,6 +84,58 @@ QUALITY_THRESHOLD = 0.25
 
 
 # ============================================================
+# BINARY GARBAGE GUARD
+# ============================================================
+
+def _is_garbage_service(service_string):
+    """
+    Detect whether a service string is binary garbage from a failed banner grab.
+
+    When service_id.py connects to a port and the remote service sends back
+    raw binary bytes (e.g. Telnet IAC sequences like  #', or rexec
+    'Where are you?' control strings), the decoder produces a short string
+    that contains non-printable characters or no alphabetic letters at all.
+    Sending that string to NVD as a keyword produces completely irrelevant
+    CVE matches (false positives).
+
+    Detection criteria — a string is 'garbage' if it meets ANY of these:
+      1. Contains any non-ASCII character (ord > 127)
+      2. Starts with a control character (ASCII 0x00-0x1F)
+      3. Has no alphabetic characters at all
+      4. More than 30% of characters are non-printable
+
+    Args:
+        service_string (str): The service name/banner string to check
+
+    Returns:
+        bool: True if the string looks like binary garbage, False if it is safe
+    """
+    if not service_string:
+        return False
+
+    text = str(service_string)
+
+    # Criterion 1: any non-ASCII character means raw bytes leaked through
+    for ch in text:
+        if ord(ch) > 127:
+            return True
+
+    # Criterion 2: starts with a control character (0x00 - 0x1f)
+    if text and ord(text[0]) < 32:
+        return True
+
+    # Criterion 3: no alphabetic characters at all (pure punctuation/digits/symbols)
+    if not any(ch.isalpha() for ch in text):
+        return True
+
+    # Criterion 4: more than 30% of characters are non-printable (ord < 32)
+    non_printable = sum(1 for ch in text if ord(ch) < 32)
+    if len(text) > 0 and non_printable / len(text) > 0.30:
+        return True
+
+    return False
+
+# ============================================================
 # INTERNAL KB VERSION GUARDS
 # ============================================================
 
@@ -219,6 +271,20 @@ def match_cves(service_map, min_cvss=MIN_CVSS_SCORE, api_key=None, os_info=None)
                 "query_method": source_result.get("query_method", "cache"),
                 "using_internal_kb": source_result.get("using_internal_kb", False),
             }
+            continue
+
+        # Skip binary garbage banners — raw bytes from failed banner grabs
+        # (e.g. Telnet IAC sequences, rexec control strings) would produce
+        # completely irrelevant NVD keyword matches if sent as-is.
+        if _is_garbage_service(service_string):
+            print(f" -> SKIPPED (binary garbage banner — not a valid service name)")
+            results[port] = {
+                "service": service_string,
+                "cves": [], "total_found": 0, "high_critical": 0,
+                "not_applicable": 0, "skipped": True,
+                "skip_reason": "binary_garbage",
+            }
+            seen_service_results[service_key] = (port, results[port])
             continue
 
         # Skip completely generic/unknown services
