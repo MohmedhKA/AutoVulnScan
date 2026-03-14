@@ -165,6 +165,9 @@ _THIRDPARTY = {
     "elinks_project", "links_project", "links",
     "phpmyadmin", "basilix", "logicworks", "pam_mysql",
     "axent", "pccs-linux", "teapop", "mysql_administrator",
+    # policyd: Postfix policy daemon — not the MTA itself; CVEs referencing
+    # this vendor (e.g. CVE-2007-3791) are irrelevant to a Postfix SMTP scan.
+    "policyd",
 }
 
 # Third-party products (by product name in CPE)
@@ -175,6 +178,8 @@ _THIRDPARTY_PRODUCTS = {
     "elinks", "links",
     "phpmyadmin", "mysqldatabaseadmintool", "pam_mysql", "basilixwebmail",
     "weberp", "netprowler", "teapop",
+    # policyd product variants (Postfix policy daemon)
+    "policyd", "cluebringer",
 }
 
 # NFS: non-Linux OS vendors — CVEs targeting these are irrelevant
@@ -659,6 +664,24 @@ def _is_platform_relevant_by_cpe(
                 sample = ", ".join(sorted(non_linux)[:3])
                 return False, f"NFS CVE targets non-Linux OS ({sample})"
 
+    # ------------------------------------------------------------------ #
+    # RPCbind / Portmapper (port 111)                                     #
+    # ------------------------------------------------------------------ #
+    # CVEs like CVE-2007-0165 target Sun Solaris rpcbind.  When the
+    # target runs Linux (or OS is unknown with no Solaris signal), these
+    # are false positives.  Reuse _NFS_NON_LINUX_OS_VENDORS — same set.
+    #
+    # Guard: only fires when ALL CPE vendors are non-Linux OS vendors and
+    # there is no "cross-platform" vendor present, mirroring the NFS guard
+    # above so we never accidentally drop a multi-OS CVE.
+    if "rpcbind" in svc_lower or "portmap" in svc_lower:
+        if vendors:
+            non_linux = vendors & _NFS_NON_LINUX_OS_VENDORS
+            has_other = bool(vendors - _NFS_NON_LINUX_OS_VENDORS)
+            if non_linux and not has_other:
+                sample = ", ".join(sorted(non_linux)[:3])
+                return False, f"RPCbind CVE targets non-Linux OS ({sample})"
+
     # IRC daemon ports should not keep IRC client-side CVEs.
     if _is_irc_daemon_service(svc_lower):
         irc_client_hits = []
@@ -791,6 +814,12 @@ def _is_platform_relevant_by_desc(description, svc_lower, detected_os, cpe_list=
         # the description contains no Linux / nfs-utils signal.
         if _NFS_NON_LINUX_DESC.search(desc) and not _NFS_LINUX_DESC.search(desc):
             return False, "NFS CVE targets non-Linux OS (by description)"
+
+    # RPCbind / Portmapper (port 111) — description-path fallback for old CVEs
+    # with no CPE data.  Matches "Solaris rpcbind" / "SunOS portmap" style text.
+    if "rpcbind" in svc_lower or "portmap" in svc_lower:
+        if _NFS_NON_LINUX_DESC.search(desc) and not _NFS_LINUX_DESC.search(desc):
+            return False, "RPCbind CVE targets non-Linux OS (by description)"
 
     return True, "no CPE data, passed description check"
 

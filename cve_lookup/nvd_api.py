@@ -1,32 +1,44 @@
 """
-nvd_api.py - NIST NVD CVE Lookup with Local Caching
-=====================================================
-This module queries the NIST National Vulnerability Database (NVD)
-to find known CVEs (Common Vulnerabilities and Exposures) for a
-given software service and version.
+nvd_api.py - Multi-Source CVE Lookup with Local Caching
+========================================================
+Primary source : CIRCL CVE Search API (https://cve.circl.lu/api/)
+                 No API key required.  No hard per-request rate limit.
+Fallback source: VulnCheck NVD++ (https://api.vulncheck.com/v3/index/nist-nvd2)
+                 Bearer token stored in api.txt.
+                 Triggered automatically on ANY CIRCL failure:
+                   • timeout / connection error
+                   • HTTP error status
+                   • empty result set
 
-API DETAILS:
-- Endpoint: https://services.nvd.nist.gov/rest/json/cves/2.0
-- Rate limit: 50 requests per 30 seconds WITH an API key
-              5 requests per 30 seconds WITHOUT a key
-- We use a 6-second delay between requests to stay well under limits
+CIRCL endpoints used:
+  Keyword search : GET /api/search/{keyword}
+  CPE search     : GET /api/search/{vendor}/{product}   (extracted from CPE)
+
+VulnCheck NVD++ endpoint:
+  GET https://api.vulncheck.com/v3/index/nist-nvd2?keyword={kw}
+  Authorization: Bearer <token>
+  Response format mirrors NVD v2.0, so extract_cve_info() reused as-is.
 
 STEALTH / EFFICIENCY:
-- Results are cached locally in a JSON file so we never re-query
-  the same service string twice (fewer requests = less noise)
-- API key is loaded from api.txt for higher rate limits
-- Minimal data is extracted from the large NVD response
+  - QUERY_DELAY = 1 s (down from 6 s — CIRCL is not rate-limited)
+  - MIN_CVSS_FILTER = 7.0  (drops known-LOW/MEDIUM noise before caching)
+  - CACHE_VERSION = 4  (forces cache invalidation; old NVD-format entries
+    are incompatible with CIRCL's CPE-2.2 format)
+  - timeout=10 s on every HTTP call (fast-fail, never stall the scan)
+  - api_key parameter kept for backward-compat — now used only as the
+    VulnCheck Bearer token override (api.txt is still the default source)
 
 USAGE (standalone):
     python cve_lookup/nvd_api.py "vsftpd 2.3.4"
     python cve_lookup/nvd_api.py "Apache 2.2.8"
 """
 
-import requests     # For making HTTP requests to the NVD API
-import json         # For parsing API responses and cache files
-import time         # For rate limiting delays
-import os           # For file path operations
-import sys          # For command line arguments
+import requests
+import json
+import time
+import os
+import sys
+from urllib.parse import quote as _urlquote
 
 # Load .env file if python-dotenv is installed
 try:
@@ -43,86 +55,121 @@ except ImportError:
 # CONFIGURATION
 # ============================================================
 
-# NVD API v2.0 endpoint for CVE search
-NVD_API_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+# Primary source — CIRCL CVE Search (no auth required)
+CIRCL_BASE_URL = "https://cve.circl.lu/api"
 
-# Delay between API requests (seconds) to respect rate limits
-REQUEST_DELAY = 6
+# Fallback source — VulnCheck NVD++ (mirrors NVD v2.0 response schema)
+VULNCHECK_URL = "https://api.vulncheck.com/v3/index/nist-nvd2"
 
-# Path to the API key file (relative to project root)
+# Path to the API key file — now holds the VulnCheck Bearer token
 API_KEY_FILE = "api.txt"
 
-# Path to the local cache file
-# Results are stored here so we don't re-query the same service
+# Local cache file path (relative to project root)
 CACHE_FILE = "cve_cache.json"
 
-# Maximum number of CVE results to fetch per query
-MAX_RESULTS = 50
+# Inter-query delay in seconds (1 s is safe for CIRCL; no hard limit)
+QUERY_DELAY = 1
 
-# Request timeout in seconds
-REQUEST_TIMEOUT = 30
+# Drop CVEs whose CVSS score is *known* and *below* this value.
+# CVEs with score == 0.0 (no published score) are kept — unknown ≠ safe.
+MIN_CVSS_FILTER = 7.0
+
+# Maximum CVEs to keep per query (after CVSS filter + sort)
+MAX_RESULTS = 100
+
+# HTTP timeout for every request — fast-fail, never stall the scanner
+REQUEST_TIMEOUT = 10
 
 # Cache format version — bump this whenever the stored data structure changes.
-# If the saved cache uses an older version it is automatically discarded so
-# the next run re-fetches full CPE configuration data from the NVD API.
-CACHE_VERSION = 3
+# v4: switched from NVD v2.0 CPE range format to CIRCL CPE-2.2/2.3 format.
+CACHE_VERSION = 4
 
 
 # ============================================================
-# CPE STRING BUILDERS
+# SERVICE → CPE MAP  (unchanged; used by get_cpe_for_service)
 # ============================================================
-# CPE (Common Platform Enumeration) strings uniquely identify
-# software products. Using CPE-based queries gives FAR more
-# accurate results than keyword searches for generic services.
 
-# Maps detected service names to NVD CPE strings for precise queries
 SERVICE_CPE_MAP = {
     # Windows OS-level services (SMB, RPC, NetBIOS)
-    # These should be queried by OS CPE, not service keyword
-    "windows_11":       "cpe:2.3:o:microsoft:windows_11:-:*:*:*:*:*:*:*",
-    "windows_10":       "cpe:2.3:o:microsoft:windows_10:-:*:*:*:*:*:*:*",
+    "windows_11":          "cpe:2.3:o:microsoft:windows_11:-:*:*:*:*:*:*:*",
+    "windows_10":          "cpe:2.3:o:microsoft:windows_10:-:*:*:*:*:*:*:*",
     "windows_server_2022": "cpe:2.3:o:microsoft:windows_server_2022:-:*:*:*:*:*:*:*",
     "windows_server_2019": "cpe:2.3:o:microsoft:windows_server_2019:-:*:*:*:*:*:*:*",
 
     # Specific software products
-    "vsftpd":           "cpe:2.3:a:vsftpd_project:vsftpd:*:*:*:*:*:*:*:*",
-    "openssh":          "cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*",
-    "apache":           "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
-    "nginx":            "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
-    "samba":            "cpe:2.3:a:samba:samba:*:*:*:*:*:*:*:*",
-    "mysql":            "cpe:2.3:a:oracle:mysql:*:*:*:*:*:*:*:*",
-    "mariadb":          "cpe:2.3:a:mariadb:mariadb:*:*:*:*:*:*:*:*",
-    "postgresql":       "cpe:2.3:a:postgresql:postgresql:*:*:*:*:*:*:*:*",
-    "iis":              "cpe:2.3:a:microsoft:internet_information_services:*:*:*:*:*:*:*:*",
+    "vsftpd":       "cpe:2.3:a:vsftpd_project:vsftpd:*:*:*:*:*:*:*:*",
+    "openssh":      "cpe:2.3:a:openbsd:openssh:*:*:*:*:*:*:*:*",
+    "apache":       "cpe:2.3:a:apache:http_server:*:*:*:*:*:*:*:*",
+    "nginx":        "cpe:2.3:a:f5:nginx:*:*:*:*:*:*:*:*",
+    "samba":        "cpe:2.3:a:samba:samba:*:*:*:*:*:*:*:*",
+    "mysql":        "cpe:2.3:a:oracle:mysql:*:*:*:*:*:*:*:*",
+    "mariadb":      "cpe:2.3:a:mariadb:mariadb:*:*:*:*:*:*:*:*",
+    "postgresql":   "cpe:2.3:a:postgresql:postgresql:*:*:*:*:*:*:*:*",
+    "iis":          "cpe:2.3:a:microsoft:internet_information_services:*:*:*:*:*:*:*:*",
+}
+
+# Maps service keyword → (vendor, product) for the CIRCL /search/{v}/{p} endpoint.
+# Covers products whose CPE vendor differs from the common service name.
+_CIRCL_VP_MAP = {
+    "vsftpd":       ("vsftpd_project",  "vsftpd"),
+    "openssh":      ("openbsd",         "openssh"),
+    "sshd":         ("openbsd",         "openssh"),
+    "apache":       ("apache",          "http_server"),
+    "httpd":        ("apache",          "http_server"),
+    "nginx":        ("nginx",           "nginx"),
+    "samba":        ("samba",           "samba"),
+    "mysql":        ("oracle",          "mysql"),
+    "mariadb":      ("mariadb",         "mariadb"),
+    "postgresql":   ("postgresql",      "postgresql"),
+    "postgres":     ("postgresql",      "postgresql"),
+    "iis":          ("microsoft",       "internet_information_services"),
+    "proftpd":      ("proftpd_project", "proftpd"),
+    "sendmail":     ("sendmail",        "sendmail"),
+    "postfix":      ("postfix",         "postfix"),
+    "dovecot":      ("dovecot",         "dovecot"),
+    "tomcat":       ("apache",          "tomcat"),
+    "unrealircd":   ("unrealircd",      "unrealircd"),
+    "ircd":         ("ircd",            "ircd"),
+    "php":          ("php",             "php"),
+    "samba":        ("samba",           "samba"),
+    "smb":          ("samba",           "samba"),
+    "windows_11":   ("microsoft",       "windows_11"),
+    "windows_10":   ("microsoft",       "windows_10"),
+    "windows":      ("microsoft",       "windows_10"),
 }
 
 
 # ============================================================
-# API KEY LOADING
+# API KEY / TOKEN LOADING
 # ============================================================
 
 def load_api_key():
     """
-    Load the NVD API key using this priority order:
-      1. NVD_API_KEY environment variable (loaded from .env by dotenv)
-      2. api.txt file in the project root (legacy fallback)
+    Load the VulnCheck Bearer token (or legacy NVD API key) using this
+    priority order:
+      1. NVD_API_KEY / VULNCHECK_TOKEN environment variable
+      2. api.txt file in the project root
+
+    The returned value is used as the VulnCheck Bearer token when CIRCL
+    fails.  The 'api_key' parameter on public functions is kept for
+    backward-compatibility; passing it explicitly overrides this loader.
 
     Returns:
-        str or None: The API key string, or None if not found
+        str or None
     """
-    # Priority 1: environment variable (set via .env file)
-    env_key = os.environ.get("NVD_API_KEY", "").strip()
-    if env_key:
-        masked = env_key[:8] + "..." + env_key[-4:]
-        print(f"[*] NVD API key loaded from .env: {masked}")
-        return env_key
+    # Priority 1: environment variable
+    for env_var in ("VULNCHECK_TOKEN", "NVD_API_KEY"):
+        env_key = os.environ.get(env_var, "").strip()
+        if env_key:
+            masked = env_key[:12] + "..." + env_key[-4:]
+            print(f"[*] VulnCheck token loaded from env ({env_var}): {masked}")
+            return env_key
 
-    # Priority 2: api.txt file (legacy fallback)
+    # Priority 2: api.txt
     possible_paths = [
         API_KEY_FILE,
         os.path.join(os.path.dirname(__file__), "..", API_KEY_FILE),
     ]
-
     for path in possible_paths:
         try:
             full_path = os.path.abspath(path)
@@ -130,14 +177,13 @@ def load_api_key():
                 with open(full_path, "r") as f:
                     key = f.read().strip()
                 if key:
-                    masked = key[:8] + "..." + key[-4:]
-                    print(f"[*] NVD API key loaded from api.txt: {masked}")
+                    masked = key[:12] + "..." + key[-4:]
+                    print(f"[*] VulnCheck token loaded from api.txt: {masked}")
                     return key
         except Exception:
             continue
 
-    print("[!] No API key found in api.txt - using unauthenticated access")
-    print("    (Rate limit: 5 requests per 30 seconds)")
+    print("[!] No VulnCheck token found — fallback disabled if CIRCL fails")
     return None
 
 
@@ -149,51 +195,43 @@ def load_cache():
     """
     Load the local CVE cache from disk.
 
-    The cache stores previous query results so we don't hit the
-    NVD API for the same service twice. This saves time and
-    reduces our network footprint.
-
     Returns:
-        dict: Cached results {service_string: [cve_list]}
+        dict: {cache_key: [cve_list], "_version": CACHE_VERSION}
     """
-    # Check multiple possible locations for the cache file
     possible_paths = [
         CACHE_FILE,
         os.path.join(os.path.dirname(__file__), "..", CACHE_FILE),
     ]
-
     for path in possible_paths:
         full_path = os.path.abspath(path)
         if os.path.exists(full_path):
             try:
                 with open(full_path, "r") as f:
                     cache = json.load(f)
-                # Discard cache if it was built by an older code version
                 if cache.get("_version") != CACHE_VERSION:
-                    print(f"[*] Cache format updated to v{CACHE_VERSION}, "
-                          f"clearing stale cache (will re-query NVD)")
+                    print(
+                        f"[*] Cache format updated to v{CACHE_VERSION}, "
+                        f"clearing stale cache (will re-query)"
+                    )
                     return {"_version": CACHE_VERSION}
-                print(f"[*] Loaded {len(cache)-1} cached queries from {CACHE_FILE}")
+                print(f"[*] Loaded {len(cache) - 1} cached queries from {CACHE_FILE}")
                 return cache
             except (json.JSONDecodeError, IOError):
-                # Cache file is corrupted, start fresh
-                print(f"[!] Cache file corrupted, starting fresh")
+                print("[!] Cache file corrupted, starting fresh")
                 return {"_version": CACHE_VERSION}
-
     return {"_version": CACHE_VERSION}
 
 
 def save_cache(cache):
     """
-    Save the CVE cache to disk.
+    Persist the CVE cache to disk.
 
     Args:
-        cache (dict): The cache dictionary to save
+        cache (dict): Cache dictionary to save
     """
-    # Save to project root
     try:
         cache_path = os.path.join(os.path.dirname(__file__), "..", CACHE_FILE)
-        full_path = os.path.abspath(cache_path)
+        full_path  = os.path.abspath(cache_path)
         cache["_version"] = CACHE_VERSION
         with open(full_path, "w") as f:
             json.dump(cache, f, indent=2)
@@ -202,81 +240,65 @@ def save_cache(cache):
 
 
 # ============================================================
-# CVE DATA EXTRACTION
+# CVE DATA EXTRACTION — NVD v2.0 format (VulnCheck fallback)
 # ============================================================
 
 def extract_cve_info(cve_item):
     """
-    Extract the important fields from a single NVD CVE record.
+    Extract important fields from a single NVD v2.0-format CVE record.
 
-    The NVD API returns a LOT of data per CVE. We only need:
-    - CVE ID (e.g. "CVE-2011-2523")
-    - CVSS score (severity number 0-10)
-    - Severity label (CRITICAL, HIGH, MEDIUM, LOW)
-    - Short description of the vulnerability
+    VulnCheck NVD++ returns items in this exact schema, so this function
+    is used unchanged for the VulnCheck fallback path.
 
     Args:
-        cve_item (dict): One CVE record from the NVD API response
+        cve_item (dict): One CVE record from NVD/VulnCheck API response
 
     Returns:
-        dict: Simplified CVE info with id, cvss, severity, description
+        dict with keys: id, cvss (float), severity, description, cpe_list
     """
     cve_data = cve_item.get("cve", {})
 
-    # Get the CVE ID
+    # CVE ID
     cve_id = cve_data.get("id", "UNKNOWN")
 
-    # Get the description (English version)
+    # English description
     description = "No description available"
-    descriptions = cve_data.get("descriptions", [])
-    for desc in descriptions:
+    for desc in cve_data.get("descriptions", []):
         if desc.get("lang") == "en":
             description = desc.get("value", description)
             break
-
-    # Truncate long descriptions
     if len(description) > 300:
         description = description[:300] + "..."
 
-    # Get CVSS score - try v3.1 first, then v3.0, then v2.0
+    # CVSS score — try v3.1, v3.0, then v2.0
     cvss_score = 0.0
-    severity = "UNKNOWN"
+    severity   = "UNKNOWN"
+    metrics    = cve_data.get("metrics", {})
 
-    metrics = cve_data.get("metrics", {})
-
-    # Try CVSS v3.1
     cvss_v31 = metrics.get("cvssMetricV31", [])
     if cvss_v31:
-        cvss_data = cvss_v31[0].get("cvssData", {})
-        cvss_score = cvss_data.get("baseScore", 0.0)
-        severity = cvss_data.get("baseSeverity", "UNKNOWN")
+        d = cvss_v31[0].get("cvssData", {})
+        cvss_score = d.get("baseScore", 0.0)
+        severity   = d.get("baseSeverity", "UNKNOWN")
 
-    # Try CVSS v3.0 if v3.1 not available
     if cvss_score == 0.0:
         cvss_v30 = metrics.get("cvssMetricV30", [])
         if cvss_v30:
-            cvss_data = cvss_v30[0].get("cvssData", {})
-            cvss_score = cvss_data.get("baseScore", 0.0)
-            severity = cvss_data.get("baseSeverity", "UNKNOWN")
+            d = cvss_v30[0].get("cvssData", {})
+            cvss_score = d.get("baseScore", 0.0)
+            severity   = d.get("baseSeverity", "UNKNOWN")
 
-    # Try CVSS v2.0 as last resort
     if cvss_score == 0.0:
         cvss_v2 = metrics.get("cvssMetricV2", [])
         if cvss_v2:
-            cvss_data = cvss_v2[0].get("cvssData", {})
-            cvss_score = cvss_data.get("baseScore", 0.0)
-            # v2 doesn't have baseSeverity, derive from score
-            if cvss_score >= 9.0:
-                severity = "CRITICAL"
-            elif cvss_score >= 7.0:
-                severity = "HIGH"
-            elif cvss_score >= 4.0:
-                severity = "MEDIUM"
-            elif cvss_score > 0:
-                severity = "LOW"
+            d = cvss_v2[0].get("cvssData", {})
+            cvss_score = d.get("baseScore", 0.0)
+            if cvss_score >= 9.0:   severity = "CRITICAL"
+            elif cvss_score >= 7.0: severity = "HIGH"
+            elif cvss_score >= 4.0: severity = "MEDIUM"
+            elif cvss_score > 0:    severity = "LOW"
 
-    # Extract CPE configuration data (vendor/product/version ranges).
-    # cpe_filter.py uses this to determine platform and version applicability.
+    # CPE configuration data (version ranges where present)
     cpe_list = []
     for config in cve_data.get("configurations", []):
         for node in config.get("nodes", []):
@@ -291,165 +313,489 @@ def extract_cve_info(cve_item):
                     })
 
     return {
-        "id": cve_id,
-        "cvss": cvss_score,
-        "severity": severity,
+        "id":          cve_id,
+        "cvss":        cvss_score,
+        "severity":    severity,
         "description": description,
-        "cpe_list": cpe_list,
+        "cpe_list":    cpe_list,
     }
 
+
 # ============================================================
-# MAIN API QUERY
+# CPE FORMAT HELPERS
+# ============================================================
+
+def _cpe22_to_cpe23(cpe22):
+    """
+    Convert a CIRCL CPE 2.2 string to CPE 2.3 format so that
+    cpe_filter.parse_cpe() can process it correctly.
+
+    cpe:/a:vsftpd_project:vsftpd:2.3.4
+        → cpe:2.3:a:vsftpd_project:vsftpd:2.3.4:*:*:*:*:*:*:*
+
+    Already CPE 2.3 strings are returned unchanged.
+    """
+    if not cpe22:
+        return ""
+    if cpe22.startswith("cpe:2.3:"):
+        return cpe22
+
+    # Strip leading "cpe:/" or "cpe:"
+    if cpe22.startswith("cpe:/"):
+        rest = cpe22[5:]
+    elif cpe22.startswith("cpe:"):
+        rest = cpe22[4:]
+    else:
+        rest = cpe22
+
+    # rest is now like "a:vendor:product:version" (first char may be the type)
+    parts = rest.split(":")
+    # Some CIRCL strings start with "/a" after the cpe: prefix was stripped
+    if parts and parts[0].startswith("/"):
+        parts[0] = parts[0][1:]
+
+    # Pad out to type, vendor, product, version
+    while len(parts) < 4:
+        parts.append("*")
+
+    cpe_type = parts[0] or "a"
+    vendor   = parts[1] if len(parts) > 1 else "*"
+    product  = parts[2] if len(parts) > 2 else "*"
+    version  = parts[3] if len(parts) > 3 else "*"
+
+    return f"cpe:2.3:{cpe_type}:{vendor}:{product}:{version}:*:*:*:*:*:*:*"
+
+
+def _cpe23_to_vendor_product(cpe23):
+    """
+    Extract (vendor, product) from a CPE 2.3 string.
+
+    cpe:2.3:a:vsftpd_project:vsftpd:*:...  →  ("vsftpd_project", "vsftpd")
+
+    Returns:
+        tuple(str, str) or (None, None) if parsing fails
+    """
+    parts = cpe23.split(":")
+    if len(parts) < 5:
+        return None, None
+    vendor  = parts[3].strip() or None
+    product = parts[4].strip() or None
+    return vendor, product
+
+
+# ============================================================
+# CIRCL CVE EXTRACTION
+# ============================================================
+
+def _extract_circl_cve(item):
+    """
+    Convert a CIRCL CVE Search API item into our standard CVE dict.
+
+    CIRCL fields used:
+      id          → CVE ID
+      summary     → description
+      cvss        → CVSS v2.0 score (string)
+      cvss3       → CVSS v3.x score (string, may be absent)
+      vulnerable_configuration → list of CPE 2.2 strings (or dicts)
+
+    Returns:
+        dict with keys: id, cvss (float), severity, description, cpe_list
+    """
+    cve_id = item.get("id", "UNKNOWN")
+
+    description = item.get("summary", "No description available") or "No description available"
+    if len(description) > 300:
+        description = description[:300] + "..."
+
+    # Prefer CVSS v3 score, fall back to CVSS v2
+    cvss_score = 0.0
+    for key in ("cvss3", "cvss-score", "cvss"):
+        raw = item.get(key)
+        if raw is not None:
+            try:
+                val = float(raw)
+                if val > 0.0:
+                    cvss_score = val
+                    break
+            except (ValueError, TypeError):
+                continue
+
+    # Derive severity from score
+    if cvss_score >= 9.0:    severity = "CRITICAL"
+    elif cvss_score >= 7.0:  severity = "HIGH"
+    elif cvss_score >= 4.0:  severity = "MEDIUM"
+    elif cvss_score > 0.0:   severity = "LOW"
+    else:                     severity = "UNKNOWN"
+
+    # Build CPE list — CIRCL returns CPE 2.2 strings (or dicts with an "id" key)
+    # Convert everything to CPE 2.3 so cpe_filter.parse_cpe() works correctly.
+    # Version range fields are absent from CIRCL data; is_version_relevant()
+    # handles this gracefully by returning True when no ranges are present.
+    cpe_list = []
+    for entry in item.get("vulnerable_configuration", []):
+        if isinstance(entry, str):
+            raw_cpe = entry
+        elif isinstance(entry, dict):
+            raw_cpe = entry.get("id", "") or entry.get("title", "")
+        else:
+            continue
+        cpe23 = _cpe22_to_cpe23(raw_cpe)
+        if cpe23:
+            cpe_list.append({
+                "criteria":              cpe23,
+                "versionStartIncluding": "",
+                "versionStartExcluding": "",
+                "versionEndIncluding":   "",
+                "versionEndExcluding":   "",
+            })
+
+    return {
+        "id":          cve_id,
+        "cvss":        cvss_score,
+        "severity":    severity,
+        "description": description,
+        "cpe_list":    cpe_list,
+    }
+
+
+def _parse_circl_response(raw):
+    """
+    Normalise a CIRCL API response into a flat list of raw CVE dicts.
+
+    CIRCL can return:
+      • A JSON list of CVE objects directly
+      • A dict with a "data" or "cves" key wrapping the list
+      • A single CVE object dict (for /api/cve/{ID})
+    """
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in ("data", "cves", "results"):
+            if key in raw and isinstance(raw[key], list):
+                return raw[key]
+        # Single CVE dict
+        if "id" in raw:
+            return [raw]
+    return []
+
+
+# ============================================================
+# CVSS FILTER
+# ============================================================
+
+def _apply_cvss_filter(cve_list):
+    """
+    Drop CVEs whose CVSS score is *known* and below MIN_CVSS_FILTER.
+
+    CVEs with score == 0.0 (no published score) are kept because
+    unknown severity must not be treated as "not critical".
+
+    Args:
+        cve_list (list): List of standard CVE dicts
+
+    Returns:
+        list: Filtered CVE list
+    """
+    return [
+        cve for cve in cve_list
+        if cve["cvss"] == 0.0 or cve["cvss"] >= MIN_CVSS_FILTER
+    ]
+
+
+# ============================================================
+# CIRCL API QUERIES
+# ============================================================
+
+def _query_circl_by_vendor_product(vendor, product):
+    """
+    Query CIRCL CVE Search using the /api/search/{vendor}/{product} endpoint.
+
+    Returns:
+        list of standard CVE dicts, or empty list on any failure
+    """
+    url = f"{CIRCL_BASE_URL}/search/{_urlquote(vendor)}/{_urlquote(product)}"
+    try:
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            print(f"  [CIRCL] HTTP {resp.status_code} for {vendor}/{product}")
+            return []
+        raw = resp.json()
+    except requests.exceptions.Timeout:
+        print(f"  [CIRCL] Timeout querying {vendor}/{product}")
+        return []
+    except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
+        print(f"  [CIRCL] Connection error: {e}")
+        return []
+    except json.JSONDecodeError:
+        print(f"  [CIRCL] Invalid JSON response")
+        return []
+
+    items = _parse_circl_response(raw)
+    results = [_extract_circl_cve(item) for item in items if isinstance(item, dict)]
+    return results
+
+
+def _query_circl_keyword(keyword):
+    """
+    Query CIRCL CVE Search using the /api/search/{keyword} endpoint.
+
+    Used as a broader fallback when no vendor/product mapping exists.
+
+    Returns:
+        list of standard CVE dicts, or empty list on any failure
+    """
+    url = f"{CIRCL_BASE_URL}/search/{_urlquote(keyword.lower())}"
+    try:
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            print(f"  [CIRCL] HTTP {resp.status_code} for keyword '{keyword}'")
+            return []
+        raw = resp.json()
+    except requests.exceptions.Timeout:
+        print(f"  [CIRCL] Timeout for keyword '{keyword}'")
+        return []
+    except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
+        print(f"  [CIRCL] Connection error: {e}")
+        return []
+    except json.JSONDecodeError:
+        print(f"  [CIRCL] Invalid JSON for keyword '{keyword}'")
+        return []
+
+    items = _parse_circl_response(raw)
+    results = [_extract_circl_cve(item) for item in items if isinstance(item, dict)]
+    return results
+
+
+def _circl_query(keyword):
+    """
+    High-level CIRCL query: tries vendor/product lookup first,
+    falls back to plain keyword search if no mapping found.
+
+    Returns:
+        list of standard CVE dicts (may be empty)
+    """
+    kw = keyword.strip().lower().split()[0] if keyword.strip() else ""
+    if not kw:
+        return []
+
+    # Prefer the precise vendor/product endpoint
+    vp = _CIRCL_VP_MAP.get(kw)
+    if vp:
+        vendor, product = vp
+        print(f"  [CIRCL] search/{vendor}/{product}")
+        results = _query_circl_by_vendor_product(vendor, product)
+        if results:
+            return results
+        print(f"  [CIRCL] VP search empty, trying keyword fallback")
+
+    # Generic keyword search
+    print(f"  [CIRCL] search/{kw} (keyword)")
+    return _query_circl_keyword(kw)
+
+
+def _circl_query_cpe(cpe23):
+    """
+    CIRCL query for a specific CPE: extracts vendor/product and uses
+    the /search/{vendor}/{product} endpoint.
+
+    Returns:
+        list of standard CVE dicts (may be empty)
+    """
+    vendor, product = _cpe23_to_vendor_product(cpe23)
+    if not vendor or not product or vendor == "*" or product == "*":
+        # Wildcard CPE — extract a useful keyword instead
+        kw = (product or vendor or "").replace("_", " ").split()[0] if (product or vendor) else ""
+        if not kw:
+            return []
+        return _circl_keyword_only(kw)
+
+    # Skip wildcard products
+    if product == "*":
+        return []
+
+    print(f"  [CIRCL] CPE → search/{vendor}/{product}")
+    results = _query_circl_by_vendor_product(vendor, product)
+    return results
+
+
+def _circl_keyword_only(kw):
+    """Thin wrapper for a plain keyword-only CIRCL search."""
+    print(f"  [CIRCL] search/{kw}")
+    return _query_circl_keyword(kw)
+
+
+# ============================================================
+# VULNCHECK NVD++ FALLBACK
+# ============================================================
+
+def _query_vulncheck(keyword, token):
+    """
+    Query VulnCheck NVD++ for CVEs matching a keyword.
+
+    VulnCheck NVD++ response wraps NVD v2.0-format items in a "data"
+    array, so extract_cve_info() is used directly on each element.
+
+    Args:
+        keyword (str): Product/service keyword to search
+        token   (str): VulnCheck Bearer token
+
+    Returns:
+        list of standard CVE dicts, or empty list on any failure
+    """
+    if not token:
+        print("  [VulnCheck] No token available, skipping fallback")
+        return []
+
+    headers = {"Authorization": f"Bearer {token}"}
+    params  = {"keyword": keyword}
+
+    try:
+        resp = requests.get(
+            VULNCHECK_URL, params=params, headers=headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code == 401:
+            print("  [VulnCheck] Token rejected (401)")
+            return []
+        if resp.status_code != 200:
+            print(f"  [VulnCheck] HTTP {resp.status_code}")
+            return []
+        data = resp.json()
+    except requests.exceptions.Timeout:
+        print("  [VulnCheck] Timeout")
+        return []
+    except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
+        print(f"  [VulnCheck] Connection error: {e}")
+        return []
+    except json.JSONDecodeError:
+        print("  [VulnCheck] Invalid JSON response")
+        return []
+
+    items = data.get("data", [])
+    results = []
+    for item in items:
+        try:
+            results.append(extract_cve_info(item))
+        except Exception:
+            continue
+    return results
+
+
+def _query_vulncheck_cpe(cpe_name, token):
+    """
+    VulnCheck NVD++ fallback for CPE-based queries.
+
+    Extracts the product name from the CPE string and runs a keyword
+    search — VulnCheck's product-level coverage is strong enough that
+    this yields equivalent results to a full CPE query.
+
+    Args:
+        cpe_name (str): CPE 2.3 string
+        token    (str): VulnCheck Bearer token
+
+    Returns:
+        list of standard CVE dicts
+    """
+    vendor, product = _cpe23_to_vendor_product(cpe_name)
+    # Use product name as keyword; strip wildcard tokens
+    kw = (product or vendor or "").replace("_", " ").replace("*", "").strip()
+    kw = kw.split()[0] if kw else ""
+    if not kw:
+        return []
+
+    print(f"  [VulnCheck] keyword='{kw}' (derived from CPE)")
+    return _query_vulncheck(kw, token)
+
+
+# ============================================================
+# MAIN API QUERY FUNCTIONS  (public — signatures preserved)
 # ============================================================
 
 def query_nvd(service_string, api_key=None, use_cache=True):
     """
-    Query the NVD API for CVEs related to a service string.
+    Query for CVEs related to a service string.
 
-    How it works:
-    1. Check the local cache first (avoid unnecessary requests)
-    2. Build a keyword search query from the service string
-    3. Send the request to NVD API v2.0
-    4. Parse the response and extract relevant CVE data
-    5. Cache the results for future use
+    Flow:
+      1. Cache hit?  Return immediately.
+      2. CIRCL primary query (vendor/product lookup, then keyword).
+      3. If CIRCL returns nothing → VulnCheck NVD++ fallback.
+      4. Apply MIN_CVSS_FILTER, sort by CVSS desc, cache + return.
 
     Args:
-        service_string (str): Service to search, e.g. "vsftpd 2.3.4"
-        api_key (str):        NVD API key (or None for unauthenticated)
-        use_cache (bool):     Whether to use/update the local cache
+        service_string (str): e.g. "vsftpd 2.3.4", "SMB", "Apache 2.2.8"
+        api_key        (str): VulnCheck Bearer token override (or None)
+        use_cache     (bool): Whether to check/update the local cache
 
     Returns:
-        list of dict: CVE records, each with id, cvss, severity, description
+        list of dict: CVE records with id, cvss, severity, description, cpe_list
     """
-    # Normalize the search string (lowercase, trimmed)
     search_key = service_string.strip().lower()
-
     if not search_key:
         print("[!] Empty service string, skipping")
         return []
 
-    # Check cache first
+    # 1 — Cache check
     cache = {}
     if use_cache:
         cache = load_cache()
         if search_key in cache:
-            cached_results = cache[search_key]
-            print(f"  [CACHE HIT] '{service_string}' → "
-                  f"{len(cached_results)} CVE(s)")
-            return cached_results
+            cached = cache[search_key]
+            print(f"  [CACHE HIT] '{service_string}' → {len(cached)} CVE(s)")
+            return cached
 
-    print(f"  [API QUERY] Searching NVD for: '{service_string}'")
+    print(f"  [QUERY] '{service_string}'")
+    token = api_key or load_api_key()
 
-    # Build the API request parameters
-    # keywordSearch does a full-text search across CVE descriptions
-    params = {
-        "keywordSearch": service_string,
-        "resultsPerPage": MAX_RESULTS,
-    }
+    # 2 — CIRCL primary
+    results = _circl_query(search_key)
+    source  = "CIRCL"
 
-    # Build request headers
-    headers = {}
-    if api_key:
-        headers["apiKey"] = api_key
+    # 3 — VulnCheck fallback (any CIRCL failure including empty result)
+    if not results:
+        print(f"  [CIRCL] No results — trying VulnCheck fallback")
+        kw = search_key.split()[0]
+        results = _query_vulncheck(kw, token)
+        source  = "VulnCheck"
 
-    # Make the API request
-    try:
-        response = requests.get(
-            NVD_API_URL,
-            params=params,
-            headers=headers,
-            timeout=REQUEST_TIMEOUT
-        )
+    print(f"  [+] {source} returned {len(results)} raw result(s)")
 
-        # If API key causes issues (404/403), retry without it
-        # Some API keys expire or get rejected silently
-        if response.status_code in (403, 404) and api_key:
-            print(f"  [!] API key rejected (HTTP {response.status_code}), "
-                  f"retrying without key...")
-            headers_no_key = {}
-            response = requests.get(
-                NVD_API_URL,
-                params=params,
-                headers=headers_no_key,
-                timeout=REQUEST_TIMEOUT
-            )
+    # 4 — Filter, sort, limit, cache
+    results = _apply_cvss_filter(results)
+    results.sort(key=lambda x: x["cvss"], reverse=True)
+    results = results[:MAX_RESULTS]
 
-        # Handle rate limiting
-        if response.status_code == 429:
-            print(f"  [!] Rate limited (429). Waiting 30 seconds...")
-            time.sleep(30)
-            # Retry once
-            response = requests.get(
-                NVD_API_URL,
-                params=params,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT
-            )
-
-        if response.status_code != 200:
-            print(f"  [!] NVD API error: HTTP {response.status_code}")
-            return []
-
-        # Parse the JSON response
-        data = response.json()
-
-    except requests.exceptions.Timeout:
-        print(f"  [!] NVD API request timed out after {REQUEST_TIMEOUT}s")
-        return []
-    except requests.exceptions.ConnectionError:
-        print(f"  [!] Could not connect to NVD API (no internet?)")
-        return []
-    except json.JSONDecodeError:
-        print(f"  [!] Invalid JSON response from NVD API")
-        return []
-
-    # Extract CVE data from the response
-    vulnerabilities = data.get("vulnerabilities", [])
-    total_results = data.get("totalResults", 0)
-
-    print(f"  [+] NVD returned {total_results} result(s)")
-
-    cve_list = []
-    for vuln_item in vulnerabilities:
-        cve_info = extract_cve_info(vuln_item)
-        cve_list.append(cve_info)
-
-    # Sort by CVSS score (highest first = most dangerous first)
-    cve_list.sort(key=lambda x: x["cvss"], reverse=True)
-
-    # Cache the results
     if use_cache:
-        cache[search_key] = cve_list
+        cache[search_key] = results
         save_cache(cache)
 
-    return cve_list
+    time.sleep(QUERY_DELAY)
+    return results
 
 
 def query_nvd_by_cpe(cpe_name, keyword_filter=None, api_key=None, use_cache=True):
     """
-    Query NVD using a CPE name for precise results.
+    Query for CVEs linked to a specific CPE string.
 
-    Unlike keyword search, CPE-based queries return only CVEs that
-    are specifically linked to the identified product/OS in the NVD
-    database.  This eliminates false positives like "SMBCMS" when
-    searching for the SMB protocol.
+    CPE-based queries are more precise than keyword searches: they map
+    directly to a vendor/product pair in CIRCL, eliminating keyword
+    noise from the start.
 
     Args:
-        cpe_name (str):        CPE 2.3 string (e.g. "cpe:2.3:o:microsoft:windows_11:...")
-        keyword_filter (str):  Optional keyword to narrow results (e.g. "SMB")
-        api_key (str):         NVD API key (or None)
-        use_cache (bool):      Whether to use local cache
+        cpe_name       (str):  CPE 2.3 string
+        keyword_filter (str):  Optional extra keyword (unused in routing,
+                               kept for backward-compat)
+        api_key        (str):  VulnCheck Bearer token override
+        use_cache     (bool):  Whether to check/update the local cache
 
     Returns:
-        list of dict: CVE records with id, cvss, severity, description
+        list of dict: CVE records with id, cvss, severity, description, cpe_list
     """
-    # Build a unique cache key from the CPE + keyword combination
     cache_key = f"cpe:{cpe_name}"
     if keyword_filter:
         cache_key += f"+{keyword_filter}"
     cache_key = cache_key.strip().lower()
 
-    # Check cache
+    # 1 — Cache check
     cache = {}
     if use_cache:
         cache = load_cache()
@@ -458,90 +804,51 @@ def query_nvd_by_cpe(cpe_name, keyword_filter=None, api_key=None, use_cache=True
             print(f"  [CACHE HIT] CPE query → {len(cached)} CVE(s)")
             return cached
 
-    print(f"  [API QUERY] CPE: {cpe_name[:60]}...")
+    print(f"  [QUERY CPE] {cpe_name[:70]}{'...' if len(cpe_name) > 70 else ''}")
     if keyword_filter:
-        print(f"              + keyword: '{keyword_filter}'")
+        print(f"             + keyword: '{keyword_filter}'")
 
-    # Build API parameters
-    params = {
-        "cpeName": cpe_name,
-        "resultsPerPage": MAX_RESULTS,
-    }
-    if keyword_filter:
-        params["keywordSearch"] = keyword_filter
+    token = api_key or load_api_key()
 
-    headers = {}
-    if api_key:
-        headers["apiKey"] = api_key
+    # 2 — CIRCL primary (by vendor/product extracted from CPE)
+    results = _circl_query_cpe(cpe_name)
+    source  = "CIRCL"
 
-    try:
-        response = requests.get(
-            NVD_API_URL, params=params, headers=headers,
-            timeout=REQUEST_TIMEOUT
-        )
+    # 3 — VulnCheck fallback
+    if not results:
+        print(f"  [CIRCL] No results — trying VulnCheck fallback")
+        results = _query_vulncheck_cpe(cpe_name, token)
+        source  = "VulnCheck"
 
-        if response.status_code in (403, 404) and api_key:
-            print(f"  [!] API key issue ({response.status_code}), retrying without key...")
-            response = requests.get(
-                NVD_API_URL, params=params, timeout=REQUEST_TIMEOUT
-            )
+    print(f"  [+] {source} returned {len(results)} raw result(s) (CPE query)")
 
-        if response.status_code == 429:
-            print(f"  [!] Rate limited. Waiting 30s...")
-            time.sleep(30)
-            response = requests.get(
-                NVD_API_URL, params=params, headers=headers,
-                timeout=REQUEST_TIMEOUT
-            )
-
-        if response.status_code != 200:
-            print(f"  [!] NVD API error: HTTP {response.status_code}")
-            return []
-
-        data = response.json()
-
-    except requests.exceptions.Timeout:
-        print(f"  [!] NVD API request timed out")
-        return []
-    except requests.exceptions.ConnectionError:
-        print(f"  [!] Could not connect to NVD API")
-        return []
-    except json.JSONDecodeError:
-        print(f"  [!] Invalid JSON from NVD API")
-        return []
-
-    vulnerabilities = data.get("vulnerabilities", [])
-    total_results = data.get("totalResults", 0)
-    print(f"  [+] NVD returned {total_results} result(s) (CPE query)")
-
-    cve_list = []
-    for vuln_item in vulnerabilities:
-        cve_info = extract_cve_info(vuln_item)
-        cve_list.append(cve_info)
-
-    cve_list.sort(key=lambda x: x["cvss"], reverse=True)
+    # 4 — Filter, sort, limit, cache
+    results = _apply_cvss_filter(results)
+    results.sort(key=lambda x: x["cvss"], reverse=True)
+    results = results[:MAX_RESULTS]
 
     if use_cache:
-        cache[cache_key] = cve_list
+        cache[cache_key] = results
         save_cache(cache)
 
-    return cve_list
+    time.sleep(QUERY_DELAY)
+    return results
 
 
 def get_cpe_for_service(service_name, os_info=None):
     """
-    Map a detected service name to a CPE string for precise NVD queries.
+    Map a detected service name to a CPE string for precise queries.
 
     Args:
         service_name (str): Service name from service_id.py
-        os_info (dict):     OS detection result from os_detect.py
+        os_info      (dict): OS detection result from os_detect.py
 
     Returns:
-        str or None: CPE string if we have a mapping, None otherwise
+        str or None: CPE 2.3 string if we have a mapping, None otherwise
     """
     svc_lower = service_name.lower()
 
-    # For Windows OS-level services, use the OS CPE
+    # Windows OS-level services — use OS CPE
     if os_info and os_info.get("os_family") == "windows":
         os_version = os_info.get("os_version", "").lower()
         if "windows 11" in os_version or "windows 10/11" in os_version:
@@ -553,7 +860,7 @@ def get_cpe_for_service(service_name, os_info=None):
         elif "server 2019" in os_version or "server 2016" in os_version:
             return SERVICE_CPE_MAP.get("windows_server_2019")
 
-    # For specific software products
+    # Specific software products
     for key, cpe in SERVICE_CPE_MAP.items():
         if key in svc_lower:
             return cpe
@@ -566,36 +873,26 @@ def get_cpe_for_service(service_name, os_info=None):
 # ============================================================
 
 if __name__ == "__main__":
-    """
-    Run from command line:
-        python cve_lookup/nvd_api.py "vsftpd 2.3.4"
-        python cve_lookup/nvd_api.py "Apache 2.2.8"
-    """
-
     if len(sys.argv) < 2:
         print("Usage: python cve_lookup/nvd_api.py \"<service_string>\"")
         print("Example: python cve_lookup/nvd_api.py \"vsftpd 2.3.4\"")
         sys.exit(1)
 
-    # Join all arguments in case the user forgot quotes
     service = " ".join(sys.argv[1:])
-
     print(f"\n[*] Looking up CVEs for: {service}")
 
-    # Load API key
     api_key = load_api_key()
-
-    # Query NVD
     results = query_nvd(service, api_key=api_key)
 
     if results:
-        print(f"\n[+] Found {len(results)} CVE(s):\n")
-        print(f"  {'CVE ID':<20} {'CVSS':<8} {'SEVERITY':<12} {'DESCRIPTION':<60}")
+        print(f"\n[+] Found {len(results)} CVE(s) (CVSS >= {MIN_CVSS_FILTER} or unknown):\n")
+        print(f"  {'CVE ID':<20} {'CVSS':<8} {'SEVERITY':<12} {'DESCRIPTION'}")
         print(f"  {'-'*20} {'-'*8} {'-'*12} {'-'*60}")
         for cve in results:
-            desc = cve['description'][:58] if len(cve['description']) > 58 else cve['description']
+            desc = cve["description"]
+            desc = desc[:58] if len(desc) > 58 else desc
             print(f"  {cve['id']:<20} {cve['cvss']:<8} {cve['severity']:<12} {desc}")
         print()
     else:
-        print("\n[*] No CVEs found for this service.")
+        print(f"\n[*] No CVEs found (or all below CVSS {MIN_CVSS_FILTER}).")
         sys.exit(1)
