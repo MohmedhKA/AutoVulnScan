@@ -4,15 +4,20 @@ nvd_api.py - Multi-Source CVE Lookup with Local Caching
 Primary source : CIRCL CVE Search API (https://cve.circl.lu/api/)
                  No API key required.  No hard per-request rate limit.
 Fallback source: VulnCheck NVD++ (https://api.vulncheck.com/v3/index/nist-nvd2)
-                 Bearer token stored in api.txt.
+                 Bearer token read from .env (preferred) or api.txt (legacy).
                  Triggered automatically on ANY CIRCL failure:
                    • timeout / connection error
                    • HTTP error status
                    • empty result set
 
+TOKEN CONFIGURATION (preferred — .env file in project root):
+  VULNCHECK_TOKEN=vulncheck_xxxxxxxxxxxx
+  Legacy fallback: api.txt in the project root (deprecated — migrate to .env)
+
 CIRCL endpoints used:
-  Keyword search : GET /api/search/{keyword}
-  CPE search     : GET /api/search/{vendor}/{product}   (extracted from CPE)
+  Vendor/product : GET /api/search/{vendor}/{product}   (from _CIRCL_VP_MAP)
+  Keyword browse : GET /api/browse/{keyword}  →  products  →  /api/search/{v}/{p}
+  CVE by ID      : GET /api/cve/{CVE-ID}      (KB enrichment)
 
 VulnCheck NVD++ endpoint:
   GET https://api.vulncheck.com/v3/index/nist-nvd2?keyword={kw}
@@ -26,7 +31,7 @@ STEALTH / EFFICIENCY:
     are incompatible with CIRCL's CPE-2.2 format)
   - timeout=10 s on every HTTP call (fast-fail, never stall the scan)
   - api_key parameter kept for backward-compat — now used only as the
-    VulnCheck Bearer token override (api.txt is still the default source)
+    VulnCheck Bearer token override (.env / api.txt is the default source)
 
 USAGE (standalone):
     python cve_lookup/nvd_api.py "vsftpd 2.3.4"
@@ -147,8 +152,10 @@ def load_api_key():
     """
     Load the VulnCheck Bearer token (or legacy NVD API key) using this
     priority order:
-      1. NVD_API_KEY / VULNCHECK_TOKEN environment variable
-      2. api.txt file in the project root
+      1. VULNCHECK_TOKEN or NVD_API_KEY environment variable  ← PREFERRED
+         Set this in a .env file at the project root:
+             VULNCHECK_TOKEN=vulncheck_xxxxxxxxxxxx
+      2. api.txt file in the project root  ← DEPRECATED LEGACY FALLBACK
 
     The returned value is used as the VulnCheck Bearer token when CIRCL
     fails.  The 'api_key' parameter on public functions is kept for
@@ -157,7 +164,7 @@ def load_api_key():
     Returns:
         str or None
     """
-    # Priority 1: environment variable
+    # Priority 1: environment variable (.env or real env) — preferred method
     for env_var in ("VULNCHECK_TOKEN", "NVD_API_KEY"):
         env_key = os.environ.get(env_var, "").strip()
         if env_key:
@@ -165,7 +172,7 @@ def load_api_key():
             print(f"[*] VulnCheck token loaded from env ({env_var}): {masked}")
             return env_key
 
-    # Priority 2: api.txt
+    # Priority 2: api.txt — DEPRECATED, kept only for backward compatibility
     possible_paths = [
         API_KEY_FILE,
         os.path.join(os.path.dirname(__file__), "..", API_KEY_FILE),
@@ -178,12 +185,16 @@ def load_api_key():
                     key = f.read().strip()
                 if key:
                     masked = key[:12] + "..." + key[-4:]
-                    print(f"[*] VulnCheck token loaded from api.txt: {masked}")
+                    print(f"[!] DEPRECATED: VulnCheck token loaded from api.txt: {masked}")
+                    print(f"[!]   Migrate to .env — add this line to .env in the project root:")
+                    print(f"[!]     VULNCHECK_TOKEN={key}")
                     return key
         except Exception:
             continue
 
     print("[!] No VulnCheck token found — fallback disabled if CIRCL fails")
+    print("[!]   To enable VulnCheck fallback, add to .env in the project root:")
+    print("[!]     VULNCHECK_TOKEN=<your_token>")
     return None
 
 
@@ -537,33 +548,67 @@ def _query_circl_by_vendor_product(vendor, product):
 
 def _query_circl_keyword(keyword):
     """
-    Query CIRCL CVE Search using the /api/search/{keyword} endpoint.
+    Fallback CIRCL query for services not in _CIRCL_VP_MAP.
 
-    Used as a broader fallback when no vendor/product mapping exists.
+    CIRCL has NO single-segment keyword search endpoint — GET /api/search/{kw}
+    returns HTTP 404.  The correct approach is a two-step browse:
 
-    Returns:
-        list of standard CVE dicts, or empty list on any failure
+      Step 1: GET /api/browse/{keyword}
+              Returns {"vendor": "<name>", "product": ["p1", "p2", ...]}
+              for vendor-name discovery.
+
+      Step 2: For each discovered product call
+              _query_circl_by_vendor_product(vendor, product)
+              and return the first non-empty result set.
+
+    Returns empty list (triggering VulnCheck fallback at caller level) when:
+      - browse returns HTTP error / timeout
+      - browse finds no products for this vendor keyword
     """
-    url = f"{CIRCL_BASE_URL}/search/{_urlquote(keyword.lower())}"
+    kw  = keyword.strip().lower()
+    url = f"{CIRCL_BASE_URL}/browse/{_urlquote(kw)}"
     try:
         resp = requests.get(url, timeout=REQUEST_TIMEOUT)
         if resp.status_code != 200:
-            print(f"  [CIRCL] HTTP {resp.status_code} for keyword '{keyword}'")
+            print(f"  [CIRCL] browse/{kw} → HTTP {resp.status_code} (no vendor found)")
             return []
-        raw = resp.json()
+        data = resp.json()
     except requests.exceptions.Timeout:
-        print(f"  [CIRCL] Timeout for keyword '{keyword}'")
+        print(f"  [CIRCL] browse/{kw} → timeout")
         return []
     except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
-        print(f"  [CIRCL] Connection error: {e}")
+        print(f"  [CIRCL] browse/{kw} → connection error: {e}")
         return []
     except json.JSONDecodeError:
-        print(f"  [CIRCL] Invalid JSON for keyword '{keyword}'")
+        print(f"  [CIRCL] browse/{kw} → invalid JSON")
         return []
 
-    items = _parse_circl_response(raw)
-    results = [_extract_circl_cve(item) for item in items if isinstance(item, dict)]
-    return results
+    # Parse the browse response — may be dict or bare list of products
+    if isinstance(data, dict):
+        vendor   = data.get("vendor", kw)
+        products = data.get("product", [])
+    elif isinstance(data, list):
+        vendor   = kw
+        products = data
+    else:
+        print(f"  [CIRCL] browse/{kw} → unexpected response type")
+        return []
+
+    if not products:
+        print(f"  [CIRCL] browse/{kw} → no products listed for this vendor")
+        return []
+
+    print(f"  [CIRCL] browse/{kw} → vendor='{vendor}', {len(products)} product(s)")
+
+    # Query each discovered product; stop at the first non-empty hit
+    # (cap at 3 products to avoid N×HTTP overhead — the first is almost
+    # always the canonical product for a single-product vendor like vsftpd).
+    for product in products[:3]:
+        results = _query_circl_by_vendor_product(vendor, str(product))
+        if results:
+            return results
+
+    return []
 
 
 def _circl_query(keyword):
@@ -619,14 +664,66 @@ def _circl_query_cpe(cpe23):
 
 
 def _circl_keyword_only(kw):
-    """Thin wrapper for a plain keyword-only CIRCL search."""
-    print(f"  [CIRCL] search/{kw}")
+    """Thin wrapper: browse-then-query CIRCL for a single keyword."""
+    print(f"  [CIRCL] browse/{kw}")
     return _query_circl_keyword(kw)
 
 
 # ============================================================
-# VULNCHECK NVD++ FALLBACK
+# CIRCL CVE-BY-ID ENRICHMENT
 # ============================================================
+
+def _fetch_circl_cve_by_id(cve_id):
+    """
+    Fetch a single CVE record by ID from CIRCL's CVE-by-ID endpoint.
+
+        GET https://cve.circl.lu/api/cve/{CVE-ID}
+
+    Purpose: enrich internal Knowledge Base entries (from known_cves.py)
+    with live CVSS scores and descriptions pulled from CIRCL, keeping
+    cached KB data fresh without a full re-scan.
+
+    This endpoint is free, requires no authentication, and is extremely
+    reliable — it returns a single object that CIRCL always has indexed
+    if the CVE was ever published by NVD or MITRE.
+
+    Args:
+        cve_id (str): e.g. "CVE-2011-2523"
+
+    Returns:
+        dict: Standard CVE dict (id, cvss, severity, description, cpe_list)
+              or None on any failure / unrecognised CVE ID
+    """
+    if not cve_id or not cve_id.upper().startswith("CVE-"):
+        return None
+
+    url = f"{CIRCL_BASE_URL}/cve/{_urlquote(cve_id.upper())}"
+    try:
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 404:
+            # CVE not in CIRCL index — not necessarily an error
+            return None
+        if resp.status_code != 200:
+            print(f"  [CIRCL] cve/{cve_id} → HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+    except requests.exceptions.Timeout:
+        print(f"  [CIRCL] cve/{cve_id} → timeout")
+        return None
+    except (requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
+        print(f"  [CIRCL] cve/{cve_id} → connection error: {e}")
+        return None
+    except json.JSONDecodeError:
+        print(f"  [CIRCL] cve/{cve_id} → invalid JSON")
+        return None
+
+    if not data or not isinstance(data, dict) or "id" not in data:
+        return None
+
+    return _extract_circl_cve(data)
+
+
+
 
 def _query_vulncheck(keyword, token):
     """
