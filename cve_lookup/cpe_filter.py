@@ -232,7 +232,63 @@ _DESC_RMI_TOPIC = re.compile(
     r'remote\s+method\s+invocation)\b', re.I
 )
 _RMI_CORE_VENDORS = {"oracle", "sun", "openjdk"}
-_RMI_CORE_PRODUCTS = {"jre", "jdk", "java_se", "openjdk"}
+_RMI_CORE_PRODUCTS = {
+    "jre", "jdk", "java_se", "openjdk",
+    "java_runtime_environment",   # legacy NVD naming pre-2013
+    "java_development_kit",       # legacy NVD naming pre-2013
+    "java_se_embedded",           # Oracle embedded JRE variant
+}
+# Vendors whose products *host* an RMI port but are NOT the JVM RMI runtime itself.
+# A CVE about these is a product bug, not a JRE bug; always a false positive on port 1099.
+_RMI_HOST_VENDORS = {
+    "cisco", "emc", "dell", "zte", "smartbear",
+    "broadcom", "netapp", "bmc", "microfocus",
+}
+_RMI_HOST_PRODUCTS = {
+    # Cisco
+    "unified_communications_manager", "prime_infrastructure",
+    "identity_services_engine", "secure_access_control_system",
+    "unity_connection", "unified_contact_center",
+    # EMC / Dell
+    "networker", "data_domain_os", "storage_center", "vplex",
+    "networker_management_console", "avamar",
+    # ZTE
+    "zxcdn", "zxr10",
+    # SmartBear / API testing tools
+    "soapui", "swagger_ui", "readyapi",
+}
+# Confirms the JRE/JDK runtime is directly at fault (used when CPE is ambiguous)
+_DESC_RMI_RUNTIME = re.compile(
+    r'\b(jdk|jre|java\s+(?:se|runtime(?:\s+environment)?|virtual\s+machine|vm)\b'
+    r'|sun\s+java|oracle\s+java|openjdk'
+    r'|java\s+(?:1\.\d+|[7-9]|1[0-9])(?:\.\d+)*)',
+    re.I,
+)
+
+# ============================================================
+# AJP CONNECTOR CONSTANTS (module-level, not inside function)
+# ============================================================
+# AJP port 8009: Tomcat only. JBoss/Undertow (redhat) and wrong-version
+# Tomcat CVEs must be dropped.
+_AJP_CORE_VENDORS  = {"apache", "vmware", "pivotal"}  # NOT redhat
+_AJP_CORE_PRODUCTS = {
+    "tomcat", "tc-server", "spring_framework",
+    "ajp", "jk_connector", "mod_jk",
+}
+# Vendors/products that have an AJP implementation but are NOT Tomcat.
+_AJP_DROP_VENDORS  = {"redhat"}   # redhat AJP → JBoss/Undertow, not Tomcat
+_AJP_DROP_PRODUCTS = {
+    "undertow", "jboss_eap", "jboss_web_server",
+    "wildfly", "http_server", "enterprise_security_manager",
+}
+# Tomcat major versions newer than any 5.x/6.x/7.x/8.x-before-patch target.
+_TOMCAT_TOO_NEW_MAJORS = frozenset({9, 10, 11})
+# Within 8.5.x, versions ≥ this patch level are "post-fix for legacy targets".
+# Metasploitable2 runs 5.5.x; 8.5.88 fixes are irrelevant to it.
+_TOMCAT_85_PATCH_GATE = 88
+_DESC_AJP_TOPIC = re.compile(
+    r'\b(ajp|tomcat|jk.?connector|mod.?jk|ghostcat|cve.2020.1938)\b', re.I
+)
 
 _X11_SERVER_VENDORS = {"x.org", "x_consortium", "xfree86", "x11"}
 _X11_SERVER_PRODUCTS = {
@@ -243,11 +299,40 @@ _DESC_X11_SERVER = re.compile(
     r'\b(x\.?org\s+server|xorg.server|x11\s+server|x\s+server|'
     r'x\.?org\s+x11|xfree86\s+server)\b', re.I
 )
+# ============================================================
+# NFS CONSTANTS
+# ============================================================
 _NFS_NON_LINUX_DESC = re.compile(
     r'\b(irix|solaris|sunos|mac\s*os|macosx|ultrix|netware|'
     r'aix|hp-?ux|tru64)\b', re.I
 )
 _NFS_LINUX_DESC = re.compile(r'\b(linux|nfs-utils|knfsd|rpc\.nfsd)\b', re.I)
+# Genuine NFS server products (keep CVEs that name these).
+_NFS_SERVER_PRODUCTS = {
+    "nfs-utils", "nfs_utils", "knfsd", "nfsd", "nfs",
+    "linux_kernel",     # kernel-land NFS server (knfsd)
+    "mountd",
+}
+# Pattern: NFS is only the *attack surface*, used by another service (SSH, Kerberos…).
+# Fires on "NFS-mounted home dir", "authorized_keys via NFS", "SSH over NFS", etc.
+# Does NOT fire on genuine nfs-utils / knfsd vulnerability descriptions.
+_NFS_SURFACE_ONLY = re.compile(
+    r'(?:'
+    r'nfs.{0,25}mount(?:ed|s)?'            # "NFS-mounted", "via NFS mounts"
+    r'|mount(?:ed|s)?.{0,15}(?:nfs|via\s+nfs)\b'  # "mounted via NFS"
+    r'|(?:ssh|rsh|rlogin|ftp|kerberos)'    # another service...
+    r'.{0,60}(?:nfs|network\s*file)'        # ...that involves NFS
+    r'|(?:nfs|network\s*file).{0,60}(?:ssh|rsh|rlogin|ftp|kerberos)'
+    r'|authorized_keys'                     # SSH key injection via NFS
+    r')',
+    re.I,
+)
+# Pattern: CVE truly is about an NFS *server* component.
+_NFS_SERVER_VULN = re.compile(
+    r'\b(nfsd|rpc\.(?:nfsd|mountd)|nfs.?utils|nfs\s+server|nfs\s+daemon|'
+    r'knfsd|exportfs|/etc/exports|nfs\s+export)\b',
+    re.I,
+)
 
 # IRC client products that should not be matched against IRC daemon services.
 _IRC_CLIENT_PRODUCTS = {
@@ -310,9 +395,69 @@ def _is_linux_samba_context(svc_lower, detected_os, os_info=None, service_map=No
     return False
 
 
-def _is_service_relevant(cpe_list, description, svc_lower):
+def _is_tomcat_version_applicable(cpe_list, sv):
+    """
+    Return False only when every explicit (non-ranged) Tomcat CPE version in this
+    CVE is strictly newer than the detected service version *sv* (a version tuple).
+
+    Rationale: NVD sometimes stores exact version CPEs without versionStart/End
+    range fields.  In that case is_version_relevant() sees "no version ranges"
+    and conservatively keeps the CVE.  This helper fills that gap for Tomcat/AJP
+    by inspecting the CPE version component directly.
+
+    Rules (applied only to unranged Tomcat CPE entries):
+      - major ≥ 9                       → always newer
+      - major == 8, minor == 5, patch ≥ _TOMCAT_85_PATCH_GATE → newer for 5/6/7 targets
+      - version == "*" / "-" / ""        → unknown, conservatively KEEP
+    If ANY entry is not "too new" the function returns True (keep).
+    """
+    if sv is None:
+        return True
+
+    tomcat_entries = [
+        e for e in cpe_list
+        if parse_cpe(e.get("criteria", "")).get("product") == "tomcat"
+    ]
+    # Only examine entries that have no range metadata (ranges are handled by
+    # is_version_relevant(), which is correct for that data).
+    unranged = [
+        e for e in tomcat_entries
+        if not any([
+            e.get("versionStartIncluding"), e.get("versionStartExcluding"),
+            e.get("versionEndIncluding"),  e.get("versionEndExcluding"),
+        ])
+    ]
+    if not unranged:
+        return True  # Nothing extra to check here
+
+    for entry in unranged:
+        cv_str = parse_cpe(entry.get("criteria", "")).get("version", "")
+        if not cv_str or cv_str in ("*", "-"):
+            return True  # Unknown version → cannot safely exclude
+        cv = _parse_ver(cv_str)
+        if cv is None:
+            return True
+        major = cv[0] if cv else 0
+        minor = cv[1] if len(cv) > 1 else 0
+        patch = cv[2] if len(cv) > 2 else 0
+        # Is this CPE version "too new" relative to the service version's family?
+        too_new = (
+            major in _TOMCAT_TOO_NEW_MAJORS
+            or (major == 8 and minor == 5 and patch >= _TOMCAT_85_PATCH_GATE)
+        )
+        if not too_new:
+            return True  # At least one CPE version is applicable → keep
+    # Every unranged Tomcat CPE is newer than the service → drop
+    return False
+
+
+def _is_service_relevant(cpe_list, description, svc_lower, service_version=None):
     """
     Ensure CVE topic matches the scanned service, not just the OS platform.
+
+    service_version is forwarded here so that service-specific version gates
+    (e.g., Tomcat 9.x CVE on a Tomcat 5.5 target) can be applied before the
+    generic is_version_relevant() pass — covering CVEs with no range metadata.
 
     Example false positive this blocks:
       service = "Microsoft Windows RPC"
@@ -337,39 +482,99 @@ def _is_service_relevant(cpe_list, description, svc_lower):
             return True, "service-topic matches RPC (by CPE product)"
         return False, "CVE not related to RPC service"
 
-    # Java RMI port should only keep genuine Java RMI CVEs.
+    # ------------------------------------------------------------------ #
+    # Java RMI (port 1099)                                                #
+    # ------------------------------------------------------------------ #
+    # We only want CVEs where the *vulnerable component IS* the Oracle/Sun/
+    # OpenJDK JRE RMI runtime, NOT vendor-specific products (Cisco UCM,
+    # EMC NetWorker, ZTE appliances, SmartBear SoapUI, …) that merely
+    # expose an RMI port.  When CPE data exists it is authoritative;
+    # we never fall through to the description when CPE is present.
     if "rmi" in svc_lower:
-        if cpe_list and (vendors & _RMI_CORE_VENDORS or products & _RMI_CORE_PRODUCTS):
-            return True, "service-topic matches Java RMI (core JDK/JRE)"
-        if _DESC_RMI_TOPIC.search(desc):
-            return True, "service-topic matches Java RMI (by description)"
+        if cpe_list:
+            # CPE data present → trust it exclusively.
+            core_v = vendors & _RMI_CORE_VENDORS
+            core_p = products & _RMI_CORE_PRODUCTS
+
+            # ---- STEP 1: core JRE pair wins unconditionally ----
+            # A CVE may carry BOTH an oracle:jre CPE and a vendor-product CPE
+            # (e.g. cisco:ucm also ships an affected JRE).  When both a core
+            # vendor AND a core product are present, the JRE runtime itself is
+            # the vulnerable component — keep regardless of any host CPEs.
+            if core_v and core_p:
+                return True, "service-topic matches Java RMI (core JDK/JRE)"
+
+            # ---- STEP 2: host-vendor/product check (no core pair found) ----
+            # Only reached when there is NO oracle:jre / sun:jdk / openjdk:openjdk
+            # core pair.  Exclude any vendor that merely hosts an RMI port inside
+            # their own product; that product bug is NOT a JRE runtime bug.
+            host_v_hit = vendors & _RMI_HOST_VENDORS
+            host_p_hit = products & _RMI_HOST_PRODUCTS
+            if host_v_hit or host_p_hit:
+                hit = ", ".join(sorted((host_v_hit | host_p_hit))[:3])
+                return False, (
+                    f"RMI port but CVE targets vendor-specific product ({hit}), "
+                    "not the JRE runtime"
+                )
+
+            # ---- STEP 3: partial match — require description confirmation ----
+            # CPE data exists (so the description path is not in play) but no
+            # clean core vendor+product pair was found.  Accept only when the
+            # description explicitly names the JRE runtime as the faulty component
+            # (guards against e.g. oracle:database CVEs slipping through).
+            if (core_v or core_p) and _DESC_RMI_TOPIC.search(desc) and _DESC_RMI_RUNTIME.search(desc):
+                return True, "service-topic matches Java RMI (partial CPE + description)"
+            return False, "CVE has CPE data but no JDK/JRE component matched"
+        else:
+            # No CPE data (pre-2008 era CVEs) — description-only fallback is safe
+            # because old JRE RMI bugs don't have NVD CPE entries.
+            if _DESC_RMI_TOPIC.search(desc):
+                return True, "service-topic matches Java RMI (by description)"
         return False, "CVE not related to Java RMI service"
 
-    # AJP connector port: only keep Tomcat and AJP-connector CVEs.
+    # ------------------------------------------------------------------ #
+    # AJP connector (port 8009)                                           #
+    # ------------------------------------------------------------------ #
+    # Keep Tomcat-only CVEs.  Drop:
+    #   • JBoss / Undertow CVEs (redhat vendor with non-Tomcat products)
+    #   • CVEs that only target Tomcat 8.5.88+, 9.x, 10.x, 11.x when the
+    #     detected service is an older branch (e.g. Metasploitable2 → 5.5.x)
     if "ajp" in svc_lower:
-        _AJP_CORE_VENDORS = {"apache", "vmware", "redhat", "pivotal"}
-        _AJP_CORE_PRODUCTS = {
-            "tomcat", "tc-server", "spring_framework",
-            "ajp", "jk_connector", "mod_jk",
-        }
-        _AJP_DROP_PRODUCTS = {
-            "undertow", "http_server", "jboss_eap",
-            "enterprise_security_manager",
-        }
-        _DESC_AJP = re.compile(
-            r'\b(ajp|tomcat|jk.?connector|mod.?jk|ghostcat|cve.2020.1938)\b',
-            re.I
-        )
         if cpe_list:
             _, vs, ps = _vendors_products(cpe_list)
-            drop_hits = ps & _AJP_DROP_PRODUCTS
-            if drop_hits:
-                return False, f"CVE targets non-Tomcat AJP product ({drop_hits})"
+            # Hard-drop: known non-Tomcat AJP products (Undertow, JBoss EAP, …)
+            drop_prod_hits = ps & _AJP_DROP_PRODUCTS
+            if drop_prod_hits:
+                return False, (
+                    "CVE targets non-Tomcat AJP product "
+                    f"({', '.join(sorted(drop_prod_hits))})"
+                )
+            # Hard-drop: redhat vendor entries that are NOT a Tomcat product
+            if vs & _AJP_DROP_VENDORS and not (ps & _AJP_CORE_PRODUCTS):
+                return False, (
+                    "CVE targets RedHat non-Tomcat AJP implementation "
+                    "(JBoss/Undertow/WildFly)"
+                )
+            # Version gate — hoisted here so it fires for ALL CPE-bearing
+            # Tomcat/AJP CVEs, not only those whose product field is "tomcat".
+            # A CVE may reach the vendor+description branch below (apache vendor,
+            # no explicit tomcat product CPE) and still carry CPE version data
+            # pointing at Tomcat 9/10/11 — this check catches that gap.
+            # _is_tomcat_version_applicable() is a no-op (returns True) when
+            # there are no unranged Tomcat CPE entries, so it is safe to call
+            # unconditionally here.
+            if service_version:
+                sv = _parse_ver(service_version)
+                if sv is not None and not _is_tomcat_version_applicable(cpe_list, sv):
+                    return False, (
+                        f"Tomcat CVE version too new for detected service "
+                        f"version {service_version}"
+                    )
             if ps & _AJP_CORE_PRODUCTS:
                 return True, "service-topic matches Tomcat/AJP"
-            if vs & _AJP_CORE_VENDORS and _DESC_AJP.search(desc):
+            if vs & _AJP_CORE_VENDORS and _DESC_AJP_TOPIC.search(desc):
                 return True, "service-topic matches AJP (vendor+description)"
-        if _DESC_AJP.search(desc):
+        if _DESC_AJP_TOPIC.search(desc):
             return True, "service-topic matches AJP (by description)"
         return False, "CVE not related to AJP/Tomcat service"
 
@@ -397,7 +602,10 @@ def _is_service_relevant(cpe_list, description, svc_lower):
     return True, "service-topic check not needed"
 
 
-def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os, os_info=None, service_map=None):
+def _is_platform_relevant_by_cpe(
+    cpe_list, svc_lower, detected_os,
+    os_info=None, service_map=None, description=None,
+):
     """Check CPE data for platform relevance. Returns (ok, reason) or None."""
     if not cpe_list:
         return None  # No CPE data → fall through to description check
@@ -410,13 +618,36 @@ def _is_platform_relevant_by_cpe(cpe_list, svc_lower, detected_os, os_info=None,
         if not is_xorg:
             return False, "non-X11-server CVE on X11 port"
 
-    # NFS port: only keep Linux / nfs-utils CVEs
+    # ------------------------------------------------------------------ #
+    # NFS (port 2049)                                                      #
+    # ------------------------------------------------------------------ #
+    # Keep: nfs-utils / knfsd / linux_kernel CVEs, AND CVEs that cover
+    #        multiple platforms (Linux + Solaris together).
+    # Drop: CVEs that only target non-Linux OS vendors (sun/sgi/bsdi/…),
+    #        packet-tool CVEs (tcpdump/Wireshark NFS dissectors),
+    #        and CVEs where NFS is only the *attack surface* for another
+    #        service (e.g. SSH root via NFS-mounted authorized_keys —
+    #        CVE-2000-0575 style).
     if "nfs" in svc_lower:
         pairs_local, vendors_local, products_local = _vendors_products(cpe_list)
 
         # Drop packet-tool CVEs (tcpdump NFS parser bugs etc.)
         if vendors_local & _NFS_TOOL_VENDORS or products_local & _NFS_TOOL_PRODUCTS:
             return False, "NFS packet-tool CVE (tcpdump/Wireshark), not nfs-utils"
+
+        # Drop CVEs where NFS is the attack surface for another service.
+        # Fired unconditionally when description is available — the old guard
+        # `products_local and not (products_local & _NFS_SERVER_PRODUCTS)` was
+        # wrong because pre-2002 CVEs often have zero CPE product entries, which
+        # caused the surface-only regex to be silently skipped entirely.
+        # _NFS_SERVER_VULN acts as a safe override: a genuine nfsd/knfsd bug
+        # will always mention one of those tokens and will not be dropped.
+        if description:
+            if (_NFS_SURFACE_ONLY.search(description)
+                    and not _NFS_SERVER_VULN.search(description)):
+                return False, (
+                    "NFS is only the attack surface, not the vulnerable component"
+                )
 
         # Drop CVEs that ONLY target non-Linux OS vendors
         if vendors_local:
@@ -544,7 +775,20 @@ def _is_platform_relevant_by_desc(description, svc_lower, detected_os, cpe_list=
         if not _DESC_X11_SERVER.search(desc):
             return False, "non-X11-server CVE on X11 port (by description)"
 
-    if "nfs" in svc_lower and not cpe_list:
+    # NFS (port 2049) — description-path filters
+    # This code path is reached ONLY when cpe_list is empty (old CVEs).
+    if "nfs" in svc_lower:
+        # Drop CVEs where NFS is only the *attack surface* for another service.
+        # Canonical example: CVE-2000-0575 — "SSH allows root access via
+        # NFS-mounted authorized_keys files."  The vulnerable component is SSH,
+        # not the NFS server; it is a false positive on port 2049.
+        if _NFS_SURFACE_ONLY.search(desc) and not _NFS_SERVER_VULN.search(desc):
+            return False, (
+                "NFS is only the attack surface for another service "
+                "(not an NFS server vulnerability)"
+            )
+        # Drop CVEs that explicitly target non-Linux operating systems when
+        # the description contains no Linux / nfs-utils signal.
         if _NFS_NON_LINUX_DESC.search(desc) and not _NFS_LINUX_DESC.search(desc):
             return False, "NFS CVE targets non-Linux OS (by description)"
 
@@ -647,6 +891,7 @@ def is_cve_applicable(cve, service_name, service_version, detected_os, os_info=N
         detected_os,
         os_info=os_info,
         service_map=service_map,
+        description=description,   # enables NFS surface-only check in CPE path
     )
 
     if cpe_result is not None:
@@ -665,7 +910,10 @@ def is_cve_applicable(cve, service_name, service_version, detected_os, os_info=N
             return False, reason
 
     # 3. Service-topic check (avoid generic OS CVEs on SMB/RPC ports)
-    ok, reason = _is_service_relevant(cpe_list, description, svc_lower)
+    ok, reason = _is_service_relevant(
+        cpe_list, description, svc_lower,
+        service_version=service_version,   # enables Tomcat/RMI version gates
+    )
     if not ok:
         return False, reason
 
