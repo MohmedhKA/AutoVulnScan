@@ -225,6 +225,21 @@ If VulnCheck is not configured or returns an error, the scanner falls back entir
 
 ---
 
+## ⚠️ Disclaimer
+
+AutoVulnScan detects vulnerabilities based on service banners and version strings. It cannot guarantee accuracy in all environments. Results may vary depending on:
+
+- Target OS and patch level
+- Whether services report accurate version information
+- Network filtering or banner manipulation
+
+**Always verify findings manually before taking action.**
+This tool is intended for educational and authorized penetration testing only. Do not use against systems you do not own or have explicit permission to test.
+
+Some CVEs may be disputed or conditionally applicable (e.g., require local/privileged access). Cross-check every finding with the official CVE database at https://nvd.nist.gov before trusting it.
+
+---
+
 ## Usage
 
 ### Launch

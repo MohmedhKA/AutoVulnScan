@@ -323,7 +323,7 @@ def page_welcome():
     st("Initializing...", "run")
     Settings.load_api_key()
     if Settings.api_key:
-        st("NVD API key loaded from .env", "ok")
+        st("CVE API key loaded from .env", "ok")
     else:
         st("No API key — CVE lookups will be rate-limited", "warn")
 
@@ -744,6 +744,27 @@ def page_results(scan_data):
                 mark = f" {RED}⚠{RESET}"
             lines.append(f"{col}{vid:<18}{RESET} {WHITE}{c['cvss']:<5}{RESET} {col}{sev:<10}{RESET}{mark}")
         draw_box(lines, title="CVE ID             CVSS  SEVERITY", width=56)
+
+        # ── DISCLAIMER ──
+        print()
+        os_confidence = os_info.get("confidence", "") if os_info else ""
+        os_family_d   = os_info.get("os_family", "unknown") if os_info else "unknown"
+        uncertain_os  = os_confidence == "low" or os_family_d == "unknown"
+        disc_lines = [
+            "Results are based on service banners and version strings",
+            "detected during scanning. Accuracy depends on:",
+            "  \u2022 Whether the target reports its real version",
+            "  \u2022 OS detection confidence (shown above)",
+            "  \u2022 CVE applicability to your specific OS/distro",
+            "",
+            "Always cross-check findings before acting on them.",
+            "False positives are possible \u2014 verify each CVE manually.",
+        ]
+        if uncertain_os:
+            disc_lines.append(
+                f"{YELLOW}\u26a0 OS detection was uncertain \u2014 some CVEs may not apply.{RESET}"
+            )
+        draw_box(disc_lines, title="\u26a0  DISCLAIMER", color=YELLOW, width=63)
 
 
 # ============================================================
